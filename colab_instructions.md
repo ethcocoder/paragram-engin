@@ -28,9 +28,20 @@ To train the foundation on 8,000+ real images (~1.1GB), run:
 ```
 
 ### Run the Scaled Trainer (T4 Optimized)
-Execute the Stage 1 trainer with batch size 16 and AdamW:
+To train for 20 epochs (starting from scratch or resuming):
 ```python
-!python src/train/trainer_stage1.py dataset/flickr8k/images
+!python src/train/trainer_stage1.py dataset/flickr8k/images --epochs 20
+```
+
+**To train for MORE epochs (e.g., 40 total):**
+```python
+!python src/train/trainer_stage1.py dataset/flickr8k/images --epochs 40
+```
+
+**To start fresh (wipe checkpoints):**
+```bash
+rm -rf checkpoints samples stage1_final_foundation.pth
+!python src/train/trainer_stage1.py dataset/flickr8k/images --epochs 20 --no_resume
 ```
 
 ## 3. Current System Status
