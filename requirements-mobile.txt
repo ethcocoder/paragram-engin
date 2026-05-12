@@ -1,0 +1,12 @@
+# Aether-Blueprint v3.0: Lightweight Mobile Dependencies
+torch>=2.0.0
+torchvision
+numpy
+pillow
+pyyaml
+onnx
+onnxruntime
+tqdm
+scipy
+lpips
+matplotlib

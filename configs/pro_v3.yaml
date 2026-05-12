@@ -1,0 +1,25 @@
+# Aether-Blueprint v3.0: Pro Configuration (Balanced Bit-rate)
+version: 3.0
+name: "Pro-V3"
+
+arch:
+  base_tile_size: 128
+  complexity_levels: 3 # Math, Texture, Detail
+  codebook_size: 1024
+  latent_dim: 512
+
+engines:
+  geometric:
+    degree: 3
+    lambda_reg: 1e-4
+  neural:
+    type: "swin_tiny"
+    ghost_ratio: 2.0
+  structural:
+    similarity_threshold: 0.95
+
+training:
+  stages: 3
+  learning_rate: 1e-4
+  batch_size: 16
+  qat_bits: 8
