@@ -47,7 +47,7 @@ class HybridDataset(Dataset):
             # In a real scenario, you'd log this and skip
             return torch.zeros(3, 512, 512)
 
-def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4):
+def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Scaling Stage 1 Training on {device} (T4 Optimized)")
     
@@ -60,24 +60,38 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4):
     for p in orchestrator.geometric_engine.parameters():
         p.requires_grad = False
         
-    # 2. Optimizer (AdamW for better weight decay handling)
+    # 2. Optimizer (AdamW)
     trainable_params = list(orchestrator.structural_engine.parameters()) + \
                       list(orchestrator.neural_engine.parameters())
     optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-2)
     scaler = torch.amp.GradScaler(device.type) if device.type == 'cuda' else None
     
-    # 3. Data Loading
+    # 3. Resume Logic
+    os.makedirs('checkpoints', exist_ok=True)
+    start_epoch = 1
+    if resume:
+        checkpoints = sorted(Path('checkpoints').glob('stage1_epoch_*.pth'), key=os.path.getmtime)
+        if checkpoints:
+            latest_ckpt = checkpoints[-1]
+            print(f"🔄 Resuming from checkpoint: {latest_ckpt}")
+            orchestrator.load_state_dict(torch.load(latest_ckpt, map_location=device))
+            # Extract epoch number from filename: stage1_epoch_5.pth -> 5
+            try:
+                start_epoch = int(latest_ckpt.stem.split('_')[-1]) + 1
+            except:
+                pass
+
+    # 4. Data Loading
     dataset = HybridDataset(data_dir)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     
-    os.makedirs('checkpoints', exist_ok=True)
     os.makedirs('samples', exist_ok=True)
     
     lambda_rec = 1.0
     lambda_commit = 0.25
     lambda_rate = 0.01
     
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         orchestrator.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         
@@ -113,8 +127,6 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4):
                     indices, _, _, _, _ = results['structural']
                     cb = orchestrator.structural_engine.codebook_module.codebook
                     selected_cb = cb[indices]
-                    # commitment loss: pull codebook towards data
-                    # (Simplified: MSE between codebook and input patches)
                     patches = orchestrator.structural_engine._subdivide(tiles[(results['mask'] == 1).view(-1)])
                     if patches.shape[0] > 0:
                         l_commit = F.mse_loss(selected_cb, patches.detach())
@@ -152,14 +164,14 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4):
         
         print(f"✅ Epoch {epoch} Complete. Avg Loss: {avg_loss:.4f}")
             
+        # Robust Save every 5 epochs
         if epoch % 5 == 0:
-            torch.save(orchestrator.state_dict(), f"checkpoints/stage1_epoch_{epoch}.pth")
+            save_path = f"checkpoints/stage1_epoch_{epoch}.pth"
+            torch.save(orchestrator.state_dict(), save_path)
+            print(f"💾 Checkpoint saved: {save_path}")
             
     torch.save(orchestrator.state_dict(), "stage1_final_foundation.pth")
     print("🏆 Training Complete. Final model saved as stage1_final_foundation.pth")
-            
-    torch.save(orchestrator.state_dict(), "stage1_foundation.pth")
-    print("Training Complete. Final model saved as stage1_foundation.pth")
 
 if __name__ == "__main__":
     # Placeholder for data dir
