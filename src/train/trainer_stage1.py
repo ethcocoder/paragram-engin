@@ -80,6 +80,11 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
                 start_epoch = int(latest_ckpt.stem.split('_')[-1]) + 1
             except:
                 pass
+        
+        if start_epoch > epochs:
+            print(f"⚠️ Resumed epoch ({start_epoch-1}) is already >= total epochs ({epochs}).")
+            print("To train further, increase the --epochs argument.")
+            return
 
     # 4. Data Loading
     dataset = HybridDataset(data_dir)
@@ -174,10 +179,25 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
     print("🏆 Training Complete. Final model saved as stage1_final_foundation.pth")
 
 if __name__ == "__main__":
-    # Placeholder for data dir
     import sys
-    data_dir = sys.argv[1] if len(sys.argv) > 1 else "dataset/flickr8k"
-    if os.path.exists(data_dir):
-        train_stage1(data_dir)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Aether-Blueprint Stage 1 Trainer")
+    parser.add_argument("data_dir", type=str, help="Path to the dataset directory")
+    parser.add_argument("--epochs", type=int, default=20, help="Total number of epochs to train")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--no_resume", action="store_true", help="Disable automatic resuming")
+    
+    args = parser.parse_args()
+    
+    if os.path.exists(args.data_dir):
+        train_stage1(
+            data_dir=args.data_dir, 
+            epochs=args.epochs, 
+            batch_size=args.batch_size, 
+            lr=args.lr, 
+            resume=not args.no_resume
+        )
     else:
-        print(f"Dataset directory {data_dir} not found. Skipping execution.")
+        print(f"❌ Dataset directory {args.data_dir} not found. Please run the downloader first.")
