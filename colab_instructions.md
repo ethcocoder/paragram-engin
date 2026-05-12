@@ -5,13 +5,11 @@ This guide will help you run the **Aether-Blueprint v3.0** training and inferenc
 ## 1. Environment Setup
 Open a new notebook in Google Colab and set the runtime to **GPU** (`Runtime` -> `Change runtime type` -> `T4 GPU`).
 
-### Clone / Upload the Code
-If you have the code in a ZIP or on GitHub, upload it to the Colab environment. 
-Alternatively, you can run this in a cell to initialize the structure:
-
-```python
-# Create the directory structure
-!mkdir -p aether-blueprint-v3/{assets,configs,deployment,src/{core,engines/{geometric,neural,structural},utils,train},tests,dataset/flickr8k}
+### Clone the Repository
+Run the following to pull the official engine:
+```bash
+!git clone https://github.com/ethcocoder/paragram-engin.git
+%cd paragram-engin
 ```
 
 ### Install Dependencies
