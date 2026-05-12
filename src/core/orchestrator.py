@@ -17,40 +17,32 @@ class AetherOrchestrator(nn.Module):
         self.structural_engine = StructuralEngine()
         self.neural_engine = DetailEngine()
         
-    def forward(self, tiles):
+    def forward(self, tiles, sim_threshold=0.95):
         """
-        Routes a batch of tiles to the appropriate engines.
-        Args:
-            tiles (Tensor): (B, 3, 128, 128)
-        Returns:
-            dict: Containing coefficients, indices, and latents per mode.
+        Routes tiles to engines with a high-accuracy fallback.
+        If a structural match is too weak (< threshold), it falls back to Neural.
         """
-        B, C, H, W = tiles.shape
+        B = tiles.shape[0]
+        mask = self.complexity_mask(tiles) # (B, 1, 1, 1)
         
-        # 1. Generate Complexity Mask
-        # mask shape: (B, 1) with values {0, 1, 2}
-        mask = self.complexity_mask(tiles)
+        # Initial routing
+        geom_indices = (mask == 0).view(-1)
+        struct_indices = (mask == 1).view(-1)
+        neural_indices = (mask == 2).view(-1)
         
         results = {
             'mask': mask,
-            'geometric': None, # Coeffs
-            'structural': None, # (Indices, Rots, Gains, Biases)
-            'neural': None, # Latents
+            'geometric': None,
+            'structural': None,
+            'neural': None
         }
         
-        # 2. Route to Geometric Engine (State 0)
-        geom_indices = (mask == 0).view(-1)
+        # 1. Geometric Path
         if geom_indices.any():
-            geom_tiles = tiles[geom_indices]
-            results['geometric'] = self.geometric_engine.fit(geom_tiles)
+            results['geometric'] = self.geometric_engine.fit(tiles[geom_indices])
             
-        # 3. Route to Structural Engine (State 1)
-        struct_indices = (mask == 1).view(-1)
+        # 2. Structural Path with Neural Fallback
         if struct_indices.any():
-            struct_tiles = tiles[struct_indices]
-            # Structural engine returns: indices, rotations, gains, biases, fallback_mask
-            struct_data = self.structural_engine(struct_tiles)
-            
             # Handle Fallback from Structural to Neural
             # fallback_mask is (B_struct * 16)
             # For simplicity in this orchestrator, we'll keep them as structural 

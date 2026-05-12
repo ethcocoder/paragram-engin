@@ -36,14 +36,21 @@ class StructuralEngine(nn.Module):
         patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(-1, C, self.patch_size, self.patch_size)
         return patches
 
+    def encode(self, tiles):
+        """
+        Full structural encoding pipeline.
+        Returns indices, params, and the maximum similarity scores.
+        """
+        patches = self._subdivide(tiles)
+        return self._match_vectorized(patches)
+
     def _match_vectorized(self, patches):
         """
         Matches patches against codebook with 4 rotations.
         Returns:
-            indices (B*16), rotations (B*16), gains (B*16), biases (B*16), fallback_mask (B*16)
+        indices (B*16), rotations (B*16), gains (B*16), biases (B*16), max_sims (B*16)
         """
-        # 1. Prepare 4 rotations of the codebook
-        # Shape: (4, num_entries, 3, 32, 32)
+        # ... (implementation same as before but returning max_sim)
         cb = self.codebook_module.codebook
         cb_rots = torch.stack([
             cb,
@@ -55,31 +62,20 @@ class StructuralEngine(nn.Module):
         N_rots, N_entries, C, H, W = cb_rots.shape
         num_patches = patches.shape[0]
         
-        # Flatten patches and rotated codebook for similarity calculation
-        patches_flat = patches.reshape(num_patches, -1) # (P, D)
-        cb_rots_flat = cb_rots.reshape(N_rots * N_entries, -1) # (4*E, D)
+        patches_flat = patches.reshape(num_patches, -1)
+        cb_rots_flat = cb_rots.reshape(N_rots * N_entries, -1)
         
-        # Normalize for cosine similarity
         patches_norm = F.normalize(patches_flat, p=2, dim=1)
         cb_rots_norm = F.normalize(cb_rots_flat, p=2, dim=1)
         
-        # Similarity matrix: (P, 4*E)
         sim = torch.matmul(patches_norm, cb_rots_norm.t())
-        
-        # Find best match (index and rotation)
         max_sim, best_idx_flat = torch.max(sim, dim=1)
         
-        # best_idx_flat is in [0, 4*E-1]
         rot_indices = best_idx_flat // N_entries
         entry_indices = best_idx_flat % N_entries
         
-        # 2. Affine Correction: target = codebook_patch * gain + bias
-        # Retrieve the best matching rotated patches
-        best_cb_patches = cb_rots[rot_indices, entry_indices] # (P, 3, 32, 32)
+        best_cb_patches = cb_rots[rot_indices, entry_indices]
         
-        # Compute Gain and Bias per patch
-        # G = cov(P, E) / var(E)
-        # B = mean(P) - G * mean(E)
         p_mean = patches.mean(dim=(1,2,3), keepdim=True)
         e_mean = best_cb_patches.mean(dim=(1,2,3), keepdim=True)
         
@@ -87,23 +83,10 @@ class StructuralEngine(nn.Module):
         e_centered = best_cb_patches - e_mean
         
         gain = (p_centered * e_centered).sum(dim=(1,2,3)) / ((e_centered**2).sum(dim=(1,2,3)) + 1e-8)
-        # Clamp gain to reasonable range
         gain = torch.clamp(gain, 0.1, 10.0)
-        
         bias = p_mean.squeeze() - gain * e_mean.squeeze()
         
-        # 3. Fallback Logic
-        fallback_mask = (max_sim < self.fallback_threshold)
-        
-        return entry_indices, rot_indices, gain, bias, fallback_mask
-
-    def forward(self, tiles):
-        """
-        Full structural encoding pipeline.
-        Returns indices and parameters for reconstruction.
-        """
-        patches = self._subdivide(tiles)
-        return self._match_vectorized(patches)
+        return entry_indices, rot_indices, gain, bias, max_sim
 
     def render(self, indices, rotations, gains, biases, B):
         """
