@@ -21,16 +21,16 @@ Run the following to install the lightweight mobile requirements:
 ## 2. Training Stage 1: The Foundation
 Stage 1 trains the **Structural Dictionary** (Pattern Memory) and the **Neural Engine** (Mobile Specialist) while keeping the Math Wizard and Complexity Mask frozen.
 
-### Prepare a Real-Life HD Dataset
-To test with real-world detail (not random noise), run this script to download 10 HD images:
-```python
-!python dataset_downloader.py
+### Prepare the Full Flickr8k Dataset
+To train the foundation on 8,000+ real images (~1.1GB), run:
+```bash
+!python dataset_downloader.py --flickr8k
 ```
 
-### Run the Trainer
-Execute the Stage 1 trainer:
+### Run the Scaled Trainer (T4 Optimized)
+Execute the Stage 1 trainer with batch size 16 and AdamW:
 ```python
-!python src/train/trainer_stage1.py dataset/flickr8k
+!python src/train/trainer_stage1.py dataset/flickr8k/images
 ```
 
 ## 3. Current System Status
