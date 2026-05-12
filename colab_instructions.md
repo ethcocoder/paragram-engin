@@ -30,7 +30,6 @@ To test with real-world detail (not random noise), run this script to download 1
 ### Run the Trainer
 Execute the Stage 1 trainer:
 ```python
-%env PYTHONPATH=.
 !python src/train/trainer_stage1.py dataset/flickr8k
 ```
 
