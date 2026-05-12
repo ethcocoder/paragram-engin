@@ -47,9 +47,9 @@ class HybridDataset(Dataset):
             # In a real scenario, you'd log this and skip
             return torch.zeros(3, 512, 512)
 
-def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
+def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image_size=256):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🚀 Scaling Stage 1 Training on {device} (T4 Optimized)")
+    print(f"🚀 Scaling Stage 1 Training on {device} (T4 Optimized) | Size: {image_size}")
     
     # 1. Initialize Orchestrator
     orchestrator = AetherOrchestrator().to(device)
@@ -87,7 +87,7 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
             return
 
     # 4. Data Loading
-    dataset = HybridDataset(data_dir)
+    dataset = HybridDataset(data_dir, image_size=image_size)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     
     os.makedirs('samples', exist_ok=True)
@@ -95,6 +95,9 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
     lambda_rec = 1.0
     lambda_commit = 0.25
     lambda_rate = 0.01
+    
+    # Calculate number of tiles per side
+    n_tiles = image_size // 128
     
     for epoch in range(start_epoch, epochs + 1):
         orchestrator.train()
@@ -108,7 +111,7 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
             images = images.to(device, non_blocking=True)
             B_img = images.shape[0]
             
-            # Tile images (512x512 -> 16 tiles of 128x128 per image)
+            # Tile images (e.g. 256x256 -> 4 tiles of 128x128 per image)
             tiles = images.unfold(2, 128, 128).unfold(3, 128, 128)
             tiles = tiles.permute(0, 2, 3, 1, 4, 5).reshape(-1, 3, 128, 128)
             B_tiles = tiles.shape[0]
@@ -121,8 +124,8 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True):
                 reconstructed_tiles = orchestrator.reconstruct(results, B_tiles)
                 
                 # Reassemble image for L1 loss
-                recon_images = reconstructed_tiles.view(B_img, 4, 4, 3, 128, 128)
-                recon_images = recon_images.permute(0, 3, 1, 4, 2, 5).reshape(B_img, 3, 512, 512)
+                recon_images = reconstructed_tiles.view(B_img, n_tiles, n_tiles, 3, 128, 128)
+                recon_images = recon_images.permute(0, 3, 1, 4, 2, 5).reshape(B_img, 3, image_size, image_size)
                 
                 # --- Loss Calculation ---
                 l_rec = F.l1_loss(recon_images, images)
@@ -184,6 +187,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Aether-Blueprint Stage 1 Trainer")
     parser.add_argument("data_dir", type=str, help="Path to the dataset directory")
+    parser.add_argument("--size", type=int, default=256, help="Image resolution (256 or 512)")
     parser.add_argument("--epochs", type=int, default=20, help="Total number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -197,7 +201,8 @@ if __name__ == "__main__":
             epochs=args.epochs, 
             batch_size=args.batch_size, 
             lr=args.lr, 
-            resume=not args.no_resume
+            resume=not args.no_resume,
+            image_size=args.size
         )
     else:
         print(f"❌ Dataset directory {args.data_dir} not found. Please run the downloader first.")
