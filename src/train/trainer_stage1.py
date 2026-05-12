@@ -62,7 +62,7 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
     
     # Configuration for Overlap Stitching
     tile_size = 128
-    overlap = 16
+    overlap = 64  # 50% overlap for perfect coverage
     stride = tile_size - overlap
     
     # 1. Initialize Orchestrator
@@ -162,14 +162,18 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
                 total_loss = (lambda_rec * l_rec + 
                               lambda_commit * l_commit + 
                               lambda_rate * l_rate + 
-                              lambda_tv * l_tv)
+                              lambda_tv * torch.clamp(l_tv, max=1.0)) # Clip TV to prevent explosion
                 
             if scaler:
                 scaler.scale(total_loss).backward()
+                # Clip gradients to prevent NaN
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
             
             # Stats update
