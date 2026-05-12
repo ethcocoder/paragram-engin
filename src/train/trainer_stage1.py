@@ -132,6 +132,7 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
     lambda_edge = 1.0     # New Edge-Match Loss
     
     for epoch in range(start_epoch, epochs + 1):
+        torch.cuda.empty_cache()
         orchestrator.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         
@@ -248,7 +249,7 @@ if __name__ == "__main__":
     parser.add_argument("data_dir", type=str, help="Path to the dataset directory")
     parser.add_argument("--size", type=int, default=256, help="Image resolution (256 or 512)")
     parser.add_argument("--epochs", type=int, default=20, help="Total number of epochs to train")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--no_resume", action="store_true", help="Disable automatic resuming")
     
