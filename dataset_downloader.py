@@ -26,13 +26,11 @@ def download_hd_test_images(num_images=10, target_dir="dataset/flickr8k"):
     print(f"🚀 Downloading {num_images} Real-Life HD images...")
     
     for i in tqdm(range(num_images)):
-        query = queries[i % len(queries)]
-        url = f"https://source.unsplash.com/featured/1024x1024?{query}"
+        # Using picsum.photos for high stability in automated tests
+        url = f"https://picsum.photos/1024/1024?random={i}"
         
         try:
-            # Note: Unsplash Source API might be redirected or rate-limited. 
-            # Using a more stable placeholder if needed, but let's try direct.
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, timeout=20)
             if response.status_code == 200:
                 img = Image.open(BytesIO(response.content))
                 # Ensure it's RGB
