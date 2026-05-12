@@ -24,17 +24,14 @@ Stage 1 trains the **Structural Dictionary** (Pattern Memory) and the **Neural E
 ### Prepare a Real-Life HD Dataset
 To test with real-world detail (not random noise), run this script to download 10 HD images:
 ```python
-# Download the helper script
-!curl -O https://raw.githubusercontent.com/USER/REPO/main/aether-blueprint-v3/dataset_downloader.py # If hosted
-# OR just run the local script if uploaded:
-!python aether-blueprint-v3/dataset_downloader.py
+!python dataset_downloader.py
 ```
 
 ### Run the Trainer
 Execute the Stage 1 trainer:
 ```python
-%env PYTHONPATH=aether-blueprint-v3
-!python aether-blueprint-v3/src/train/trainer_stage1.py dataset/flickr8k
+%env PYTHONPATH=.
+!python src/train/trainer_stage1.py dataset/flickr8k
 ```
 
 ## 3. Current System Status
