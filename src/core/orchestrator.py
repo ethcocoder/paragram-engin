@@ -19,16 +19,11 @@ class AetherOrchestrator(nn.Module):
         
     def forward(self, tiles, sim_threshold=0.95):
         """
-        Routes tiles to engines with a high-accuracy fallback.
-        If a structural match is too weak (< threshold), it falls back to Neural.
+        Routes tiles to engines based on Complexity Mask with a Neural Fallback.
+        If structural match similarity is < threshold, it falls back to Neural.
         """
         B = tiles.shape[0]
         mask = self.complexity_mask(tiles) # (B, 1, 1, 1)
-        
-        # Initial routing
-        geom_indices = (mask == 0).view(-1)
-        struct_indices = (mask == 1).view(-1)
-        neural_indices = (mask == 2).view(-1)
         
         results = {
             'mask': mask,
@@ -38,22 +33,40 @@ class AetherOrchestrator(nn.Module):
         }
         
         # 1. Geometric Path
+        geom_indices = (mask == 0).view(-1)
         if geom_indices.any():
             results['geometric'] = self.geometric_engine.fit(tiles[geom_indices])
             
-        # 2. Structural Path with Neural Fallback
+        # 2. Structural Path with Fallback
+        struct_indices = (mask == 1).view(-1)
         if struct_indices.any():
-            # Handle Fallback from Structural to Neural
-            # fallback_mask is (B_struct * 16)
-            # For simplicity in this orchestrator, we'll keep them as structural 
-            # and let the trainer/packer handle fallback if needed.
-            results['structural'] = struct_data
+            # Initial encode to check similarity
+            struct_out = self.structural_engine.encode(tiles[struct_indices])
+            indices, rots, gains, biases, sims = struct_out
             
-        # 4. Route to Neural Engine (State 2)
+            # Identify weak matches
+            weak_mask = (sims < sim_threshold)
+            if weak_mask.any():
+                # Re-route weak tiles to Neural mode (2)
+                # Find the global indices of these weak tiles
+                global_struct_indices = torch.where(struct_indices)[0]
+                global_weak_indices = global_struct_indices[weak_mask]
+                mask[global_weak_indices] = 2
+                
+                # Filter structural results for only strong matches
+                strong_mask = ~weak_mask
+                if strong_mask.any():
+                    results['structural'] = (
+                        indices[strong_mask], rots[strong_mask], 
+                        gains[strong_mask], biases[strong_mask], sims[strong_mask]
+                    )
+            else:
+                results['structural'] = struct_out
+            
+        # 3. Neural Path (including Fallbacks)
         neural_indices = (mask == 2).view(-1)
         if neural_indices.any():
-            neural_tiles = tiles[neural_indices]
-            results['neural'] = self.neural_engine.encode(neural_tiles)
+            results['neural'] = self.neural_engine.encode(tiles[neural_indices])
             
         return results
 
