@@ -120,6 +120,8 @@ class AetherOrchestrator(nn.Module):
             
         # 3. Blending with Fold
         # Apply weighting mask to all rendered tiles
+        # Clamp to prevent extreme values from exploding
+        all_rendered = torch.clamp(all_rendered, -10.0, 10.0)
         all_rendered = all_rendered * weight_mask.view(1, 1, 128, 128)
         
         # Reshape for fold: (B_img, 3 * 128 * 128, num_tiles)
@@ -144,4 +146,5 @@ class AetherOrchestrator(nn.Module):
             stride=(stride, stride)
         )
         
-        return combined / (weight_sum + 1e-8)
+        # Use larger epsilon and clamp final image
+        return torch.clamp(combined / (weight_sum + 1e-4), 0.0, 1.0)

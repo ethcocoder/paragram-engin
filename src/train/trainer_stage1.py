@@ -134,12 +134,22 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
             optimizer.zero_grad()
             
             with torch.amp.autocast(device.type):
-                # Forward Pass
+                # --- Forward Pass with NaN Debugging ---
                 results = orchestrator(tiles)
+                
+                # Check for NaNs in each engine output
+                for key in ['geometric', 'structural', 'neural']:
+                    if results[key] is not None:
+                        val = results[key][0] if isinstance(results[key], tuple) else results[key]
+                        if torch.isnan(val).any():
+                            print(f"❌ NaN detected in {key} engine output!")
                 
                 # Reconstruct with Gaussian Blending
                 recon_images = orchestrator.reconstruct(results, B_tiles, image_size=image_size, overlap=overlap)
                 
+                if torch.isnan(recon_images).any():
+                    print("❌ NaN detected in reconstructed image!")
+
                 # --- Multi-Objective Loss ---
                 l_rec = F.l1_loss(recon_images, images)
                 
@@ -157,12 +167,13 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
                 
                 l_rate = torch.tensor(0.0, device=device)
                 if results['neural'] is not None:
-                    l_rate = torch.mean(torch.abs(results['neural']))
+                    # Use sqrt(x^2 + eps) for robust absolute value
+                    l_rate = torch.mean(torch.sqrt(results['neural']**2 + 1e-6))
                 
                 total_loss = (lambda_rec * l_rec + 
                               lambda_commit * l_commit + 
                               lambda_rate * l_rate + 
-                              lambda_tv * torch.clamp(l_tv, max=1.0)) # Clip TV to prevent explosion
+                              lambda_tv * torch.clamp(l_tv, max=1.0))
                 
             if scaler:
                 scaler.scale(total_loss).backward()
