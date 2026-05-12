@@ -57,11 +57,11 @@ def train_stage1(data_dir, epochs=20, batch_size=8, lr=1e-4):
     trainable_params = list(orchestrator.structural_engine.parameters()) + \
                       list(orchestrator.neural_engine.parameters())
     optimizer = optim.Adam(trainable_params, lr=lr)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device.type) if device.type == 'cuda' else None
     
     # 3. Data Loading
     dataset = HybridDataset(data_dir)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     
     # 4. Checkpoints Dir
     os.makedirs('checkpoints', exist_ok=True)
@@ -89,7 +89,7 @@ def train_stage1(data_dir, epochs=20, batch_size=8, lr=1e-4):
             
             optimizer.zero_grad()
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device.type):
                 # Forward Pass
                 results = orchestrator(tiles)
                 reconstructed_tiles = orchestrator.reconstruct(results, B_tiles)
@@ -125,9 +125,13 @@ def train_stage1(data_dir, epochs=20, batch_size=8, lr=1e-4):
                 
                 total_loss = lambda_rec * l_rec + lambda_commit * l_commit + lambda_rate * l_rate
                 
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler:
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                optimizer.step()
             
             # Stats
             epoch_losses.append(total_loss.item())

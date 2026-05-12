@@ -70,25 +70,35 @@ class AetherOrchestrator(nn.Module):
         Reassembles an image from the hybrid results.
         """
         mask = results['mask']
-        reconstructed_tiles = torch.zeros(B, 3, 128, 128, device=mask.device)
+        device = mask.device
+        
+        # We'll use the dtype of the first available engine output, or default to float32
+        target_dtype = torch.float32
+        for key in ['neural', 'geometric']:
+            if results[key] is not None:
+                target_dtype = results[key].dtype
+                break
+            
+        reconstructed_tiles = torch.zeros(B, 3, 128, 128, device=device, dtype=target_dtype)
         
         # Restore Geometric
         if results['geometric'] is not None:
             geom_indices = (mask == 0).view(-1)
-            reconstructed_tiles[geom_indices] = self.geometric_engine.render(results['geometric'])
+            reconstructed_tiles[geom_indices] = self.geometric_engine.render(results['geometric']).to(target_dtype)
             
         # Restore Structural
         if results['structural'] is not None:
             struct_indices = (mask == 1).view(-1)
             indices, rotations, gains, biases, _ = results['structural']
             B_struct = struct_indices.sum().item()
-            reconstructed_tiles[struct_indices] = self.structural_engine.render(
+            render_out = self.structural_engine.render(
                 indices, rotations, gains, biases, int(B_struct)
             )
+            reconstructed_tiles[struct_indices] = render_out.to(target_dtype)
             
         # Restore Neural
         if results['neural'] is not None:
             neural_indices = (mask == 2).view(-1)
-            reconstructed_tiles[neural_indices] = self.neural_engine.decode(results['neural'])
+            reconstructed_tiles[neural_indices] = self.neural_engine.decode(results['neural']).to(target_dtype)
             
         return reconstructed_tiles
