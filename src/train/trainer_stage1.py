@@ -10,6 +10,11 @@ from pathlib import Path
 from tqdm import tqdm
 import torchvision.utils as vutils
 
+import sys
+from pathlib import Path
+# Add the project root to sys.path to ensure 'src' is found
+sys.path.append(str(Path(__file__).parent.parent.parent))
+
 from src.core.orchestrator import AetherOrchestrator
 from src.utils.tiling_v3 import SmartTiler
 

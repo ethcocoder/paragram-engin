@@ -5,7 +5,11 @@ The entry point for the Aether-Blueprint system. Provides a clean API
 for compression, decompression, and training orchestration.
 """
 import sys
-from aether_blueprint.src.core.orchestrator import AetherOrchestrator
+from pathlib import Path
+# Add the project root to sys.path to ensure 'src' is found
+sys.path.append(str(Path(__file__).parent))
+
+from src.core.orchestrator import AetherOrchestrator
 
 def main():
     """
