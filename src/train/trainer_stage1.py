@@ -47,9 +47,23 @@ class HybridDataset(Dataset):
             # In a real scenario, you'd log this and skip
             return torch.zeros(3, 512, 512)
 
+def total_variation_loss(img):
+    """
+    Penalizes sharp pixel jumps between horizontal and vertical neighbors.
+    Enforces spatial smoothness across tile boundaries.
+    """
+    tv_h = torch.pow(img[:, :, 1:, :] - img[:, :, :-1, :], 2).sum()
+    tv_w = torch.pow(img[:, :, :, 1:] - img[:, :, :, :-1], 2).sum()
+    return (tv_h + tv_w) / img.shape[0]
+
 def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image_size=256):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Scaling Stage 1 Training on {device} (T4 Optimized) | Size: {image_size}")
+    
+    # Configuration for Overlap Stitching
+    tile_size = 128
+    overlap = 16
+    stride = tile_size - overlap
     
     # 1. Initialize Orchestrator
     orchestrator = AetherOrchestrator().to(device)
@@ -75,7 +89,6 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
             latest_ckpt = checkpoints[-1]
             print(f"🔄 Resuming from checkpoint: {latest_ckpt}")
             orchestrator.load_state_dict(torch.load(latest_ckpt, map_location=device))
-            # Extract epoch number from filename: stage1_epoch_5.pth -> 5
             try:
                 start_epoch = int(latest_ckpt.stem.split('_')[-1]) + 1
             except:
@@ -95,9 +108,7 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
     lambda_rec = 1.0
     lambda_commit = 0.25
     lambda_rate = 0.01
-    
-    # Calculate number of tiles per side
-    n_tiles = image_size // 128
+    lambda_tv = 0.05
     
     for epoch in range(start_epoch, epochs + 1):
         orchestrator.train()
@@ -111,8 +122,12 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
             images = images.to(device, non_blocking=True)
             B_img = images.shape[0]
             
-            # Tile images (e.g. 256x256 -> 4 tiles of 128x128 per image)
-            tiles = images.unfold(2, 128, 128).unfold(3, 128, 128)
+            # --- Overlap-Aware Tiling ---
+            # Instead of simple unfold, we use sliding window with overlap
+            # (B, 3, 256, 256) -> (B, 3, 128, 128, num_tiles)
+            tiles = images.unfold(2, tile_size, stride).unfold(3, tile_size, stride)
+            # Shape: (B, 3, n_h, n_w, 128, 128)
+            B, C, NH, NW, TH, TW = tiles.shape
             tiles = tiles.permute(0, 2, 3, 1, 4, 5).reshape(-1, 3, 128, 128)
             B_tiles = tiles.shape[0]
             
@@ -121,14 +136,15 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
             with torch.amp.autocast(device.type):
                 # Forward Pass
                 results = orchestrator(tiles)
-                reconstructed_tiles = orchestrator.reconstruct(results, B_tiles)
                 
-                # Reassemble image for L1 loss
-                recon_images = reconstructed_tiles.view(B_img, n_tiles, n_tiles, 3, 128, 128)
-                recon_images = recon_images.permute(0, 3, 1, 4, 2, 5).reshape(B_img, 3, image_size, image_size)
+                # Reconstruct with Gaussian Blending
+                recon_images = orchestrator.reconstruct(results, B_tiles, image_size=image_size, overlap=overlap)
                 
-                # --- Loss Calculation ---
+                # --- Multi-Objective Loss ---
                 l_rec = F.l1_loss(recon_images, images)
+                
+                # Total Variation (TV) Loss - The Contextual Glue
+                l_tv = total_variation_loss(recon_images)
                 
                 l_commit = torch.tensor(0.0, device=device)
                 if results['structural'] is not None:
@@ -143,7 +159,10 @@ def train_stage1(data_dir, epochs=20, batch_size=16, lr=1e-4, resume=True, image
                 if results['neural'] is not None:
                     l_rate = torch.mean(torch.abs(results['neural']))
                 
-                total_loss = lambda_rec * l_rec + lambda_commit * l_commit + lambda_rate * l_rate
+                total_loss = (lambda_rec * l_rec + 
+                              lambda_commit * l_commit + 
+                              lambda_rate * l_rate + 
+                              lambda_tv * l_tv)
                 
             if scaler:
                 scaler.scale(total_loss).backward()

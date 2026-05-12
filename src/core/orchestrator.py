@@ -65,26 +65,43 @@ class AetherOrchestrator(nn.Module):
             
         return results
 
-    def reconstruct(self, results, B):
+    def reconstruct(self, results, B, image_size=256, overlap=16):
         """
-        Reassembles an image from the hybrid results.
+        Reassembles an image from hybrid results using Overlap-Aware Stitching.
+        Uses F.fold to blend tiles with a Gaussian-like weighting mask.
         """
         mask = results['mask']
         device = mask.device
         
-        # We'll use the dtype of the first available engine output, or default to float32
         target_dtype = torch.float32
         for key in ['neural', 'geometric']:
             if results[key] is not None:
                 target_dtype = results[key].dtype
                 break
             
-        reconstructed_tiles = torch.zeros(B, 3, 128, 128, device=device, dtype=target_dtype)
+        tile_size = 128
+        stride = tile_size - overlap
+        
+        # 1. Create a Weighting Mask (Cosine/Gaussian taper)
+        # Smoothly fades out towards the edges
+        taper = torch.hann_window(tile_size, periodic=False).view(1, tile_size)
+        weight_mask = (taper.T @ taper).to(device).to(target_dtype) # (128, 128)
+        
+        # 2. Accumulators for Fold
+        # We process image by image to avoid huge memory spikes in Fold
+        # B_img is calculated from the total number of tiles B
+        # tiles_per_side = (image_size - tile_size) // stride + 1
+        # B = B_img * (tiles_per_side**2)
+        tiles_per_side = (image_size - tile_size) // stride + 1
+        B_img = B // (tiles_per_side**2)
+        
+        # We'll render all tiles first
+        all_rendered = torch.zeros(B, 3, 128, 128, device=device, dtype=target_dtype)
         
         # Restore Geometric
         if results['geometric'] is not None:
             geom_indices = (mask == 0).view(-1)
-            reconstructed_tiles[geom_indices] = self.geometric_engine.render(results['geometric']).to(target_dtype)
+            all_rendered[geom_indices] = self.geometric_engine.render(results['geometric']).to(target_dtype)
             
         # Restore Structural
         if results['structural'] is not None:
@@ -94,11 +111,37 @@ class AetherOrchestrator(nn.Module):
             render_out = self.structural_engine.render(
                 indices, rotations, gains, biases, int(B_struct)
             )
-            reconstructed_tiles[struct_indices] = render_out.to(target_dtype)
+            all_rendered[struct_indices] = render_out.to(target_dtype)
             
         # Restore Neural
         if results['neural'] is not None:
             neural_indices = (mask == 2).view(-1)
-            reconstructed_tiles[neural_indices] = self.neural_engine.decode(results['neural']).to(target_dtype)
+            all_rendered[neural_indices] = self.neural_engine.decode(results['neural']).to(target_dtype)
             
-        return reconstructed_tiles
+        # 3. Blending with Fold
+        # Apply weighting mask to all rendered tiles
+        all_rendered = all_rendered * weight_mask.view(1, 1, 128, 128)
+        
+        # Reshape for fold: (B_img, 3 * 128 * 128, num_tiles)
+        num_tiles_per_img = tiles_per_side**2
+        all_rendered = all_rendered.view(B_img, num_tiles_per_img, 3, 128, 128).permute(0, 2, 3, 4, 1).reshape(B_img, 3 * 128 * 128, num_tiles_per_img)
+        
+        # Output accumulation
+        combined = torch.nn.functional.fold(
+            all_rendered, 
+            output_size=(image_size, image_size), 
+            kernel_size=(128, 128), 
+            stride=(stride, stride)
+        )
+        
+        # Weight accumulation (to normalize the overlap)
+        ones = torch.ones(B_img, num_tiles_per_img, 1, 128, 128, device=device, dtype=target_dtype) * weight_mask.view(1, 1, 1, 128, 128)
+        ones = ones.permute(0, 2, 3, 4, 1).reshape(B_img, 1 * 128 * 128, num_tiles_per_img)
+        weight_sum = torch.nn.functional.fold(
+            ones, 
+            output_size=(image_size, image_size), 
+            kernel_size=(128, 128), 
+            stride=(stride, stride)
+        )
+        
+        return combined / (weight_sum + 1e-8)
