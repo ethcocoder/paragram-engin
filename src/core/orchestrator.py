@@ -9,20 +9,48 @@ class AetherOrchestrator(nn.Module):
     """
     The Hybrid Brain (The Switch): Coordinates the Complexity Mask and routes
     tiles to the optimal compression engine (Geometric, Structural, or Neural).
+    
+    Threshold Curriculum:
+        Instead of a hard similarity threshold, the threshold ramps linearly
+        from `curriculum_start` (0.70) to `curriculum_end` (0.90) over
+        `curriculum_epochs` (10) epochs. This allows the Structural Engine
+        to begin contributing early while its codebook is still immature.
     """
-    def __init__(self, config=None):
+    def __init__(self, config=None, curriculum_start=0.70, curriculum_end=0.90, curriculum_epochs=10):
         super().__init__()
         self.complexity_mask = ComplexityMask()
         self.geometric_engine = PolynomialSurfaceFitter()
         self.structural_engine = StructuralEngine()
         self.neural_engine = DetailEngine()
         
-    def forward(self, tiles, sim_threshold=0.95):
+        # Curriculum parameters (not nn.Parameters — these are scheduling constants)
+        self.curriculum_start = curriculum_start
+        self.curriculum_end = curriculum_end
+        self.curriculum_epochs = curriculum_epochs
+    
+    def get_curriculum_threshold(self, current_epoch):
+        """Compute the similarity threshold for the current epoch."""
+        if current_epoch >= self.curriculum_epochs:
+            return self.curriculum_end
+        progress = current_epoch / max(self.curriculum_epochs, 1)
+        return self.curriculum_start + progress * (self.curriculum_end - self.curriculum_start)
+        
+    def forward(self, tiles, sim_threshold=None, current_epoch=0):
         """
         Routes tiles to engines based on Complexity Mask with a Neural Fallback.
         If structural match similarity is < threshold, it falls back to Neural.
+        
+        Args:
+            tiles: (B, 3, 128, 128) input tile batch.
+            sim_threshold: explicit override; if None, uses curriculum schedule.
+            current_epoch: used to compute curriculum threshold when sim_threshold is None.
         """
         B = tiles.shape[0]
+        
+        # Resolve threshold via curriculum schedule
+        if sim_threshold is None:
+            sim_threshold = self.get_curriculum_threshold(current_epoch)
+        
         mask = self.complexity_mask(tiles) # (B, 1, 1, 1)
         
         results = {
@@ -44,21 +72,27 @@ class AetherOrchestrator(nn.Module):
             struct_out = self.structural_engine.encode(tiles[struct_indices])
             indices, rots, gains, biases, sims = struct_out
             
-            # Identify weak matches
-            weak_mask = (sims < sim_threshold)
-            if weak_mask.any():
+            # Identify weak matches (Tile-level decision)
+            # sims has shape (N_tiles * 16,) -> reshape to (N_tiles, 16)
+            sims_per_tile = sims.view(-1, 16)
+            # If ANY patch in the tile is weak, re-route the entire tile
+            weak_tile_mask = (sims_per_tile.min(dim=1)[0] < sim_threshold)
+            
+            if weak_tile_mask.any():
                 # Re-route weak tiles to Neural mode (2)
-                # Find the global indices of these weak tiles
                 global_struct_indices = torch.where(struct_indices)[0]
-                global_weak_indices = global_struct_indices[weak_mask]
+                global_weak_indices = global_struct_indices[weak_tile_mask]
                 mask[global_weak_indices] = 2
                 
-                # Filter structural results for only strong matches
-                strong_mask = ~weak_mask
-                if strong_mask.any():
+                # Filter structural results for only strong tiles
+                strong_tile_mask = ~weak_tile_mask
+                if strong_tile_mask.any():
+                    # We need to filter the patch-level data too (16 patches per tile)
+                    # Create a patch-level mask from the tile-level mask
+                    strong_patch_mask = strong_tile_mask.repeat_interleave(16)
                     results['structural'] = (
-                        indices[strong_mask], rots[strong_mask], 
-                        gains[strong_mask], biases[strong_mask], sims[strong_mask]
+                        indices[strong_patch_mask], rots[strong_patch_mask], 
+                        gains[strong_patch_mask], biases[strong_patch_mask], sims[strong_patch_mask]
                     )
             else:
                 results['structural'] = struct_out
@@ -127,6 +161,8 @@ class AetherOrchestrator(nn.Module):
         # Apply weighting mask to all rendered tiles
         # Clamp to prevent extreme values from exploding
         all_rendered = torch.clamp(all_rendered, -10.0, 10.0)
+        # Replace any residual NaNs with zeros (Artifact Protection)
+        all_rendered = torch.where(torch.isnan(all_rendered), torch.zeros_like(all_rendered), all_rendered)
         all_rendered = all_rendered * weight_mask.view(1, 1, 128, 128)
         
         # Reshape for fold: (B_img, 3 * 128 * 128, num_tiles)
@@ -151,5 +187,5 @@ class AetherOrchestrator(nn.Module):
             stride=(stride, stride)
         )
         
-        # Use larger epsilon and clamp final image
-        return torch.clamp(combined / (weight_sum + 1e-4), 0.0, 1.0)
+        # Use epsilon = 1e-6 in the division to prevent NaN (Artifact Protection)
+        return torch.clamp(combined / (weight_sum + 1e-6), 0.0, 1.0)
