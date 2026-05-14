@@ -9,7 +9,7 @@ ENV/
 # Datasets & Models
 dataset/
 checkpoints/
-*.pth
+
 *.png
 
 # IDEs
