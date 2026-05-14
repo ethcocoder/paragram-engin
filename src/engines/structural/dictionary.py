@@ -136,27 +136,33 @@ class StructuralEngine(nn.Module):
         NP        = patches.shape[0]
         flat_p    = patches.view(NP, -1).float()    # (N*P, D)  D=C*Ps*Ps
  
-        # Codebook entries
-        cb        = self.codebook.weight              # (K, D)
+        # Codebook entries - force float32 for matching precision
+        cb        = self.codebook.weight.float()      # (K, D)
         cb_norm   = F.normalize(cb, dim=1)
         flat_norm = F.normalize(flat_p, dim=1)
  
         # Try all 4 rotations, keep best
         D = Ps * Ps * 3
-        best_sim  = torch.full((NP,), -1.0, device=tiles.device)
+        # Initialize best_sim as float32 to match matching results
+        best_sim  = torch.full((NP,), -1.0, device=tiles.device, dtype=torch.float32)
         best_idx  = torch.zeros(NP, dtype=torch.long, device=tiles.device)
         best_rot  = torch.zeros(NP, dtype=torch.long, device=tiles.device)
  
-        for rot_k in self.ROTATIONS:
-            rot_patches  = torch.stack([self._rotate_k(patches[i], rot_k)
-                                        for i in range(NP)])   # (NP, C, Ps, Ps)
-            rot_flat     = F.normalize(rot_patches.view(NP, -1).float(), dim=1)
-            sims         = rot_flat @ cb_norm.t()               # (NP, K)
-            top_sim, top_idx = sims.max(dim=1)                  # (NP,)
-            better = top_sim > best_sim
-            best_sim[better] = top_sim[better]
-            best_idx[better] = top_idx[better]
-            best_rot[better] = rot_k
+        # FORCE DISABLE AUTOCAST for the matching loop to ensure float32
+        with torch.amp.autocast('cuda', enabled=False):
+            for rot_k in self.ROTATIONS:
+                rot_patches  = torch.stack([self._rotate_k(patches[i], rot_k)
+                                            for i in range(NP)])   # (NP, C, Ps, Ps)
+                # Ensure rot_flat is float32
+                rot_flat     = F.normalize(rot_patches.view(NP, -1).float(), dim=1)
+                # Ensure matmul is float32
+                sims         = rot_flat @ cb_norm.t()               # (NP, K)
+                top_sim, top_idx = sims.max(dim=1)                  # (NP,)
+                top_sim = top_sim.float() # ENSURE float32 for assignment
+                better = top_sim > best_sim
+                best_sim[better] = top_sim[better]
+                best_idx[better] = top_idx[better]
+                best_rot[better] = rot_k
  
         # Affine correction using best-matching (rotated) codebook entry
         matched_cb  = self.codebook(best_idx)                   # (NP, D)
@@ -171,18 +177,21 @@ class StructuralEngine(nn.Module):
                 matched_tiled[mask] = rot_cb.view(-1, D)
  
         gains, biases = self._affine_correct(matched_tiled, flat_p)
- 
+
         # Reshape similarities to (N, P) for tile-level min check
         sim_per_tile = best_sim.view(N, P)          # (N, P)
- 
+
+        # Cast back to input dtype for gains/biases to maintain consistency in mixed precision
+        orig_dtype = tiles.dtype
         return {
             'indices'     : best_idx,               # (N*P,)
             'rotations'   : best_rot,               # (N*P,)
-            'gains'       : gains,                  # (N*P,)
-            'biases'      : biases,                 # (N*P,)
-            'similarities': sim_per_tile,           # (N, P)
+            'gains'       : gains.to(orig_dtype),    # (N*P,)
+            'biases'      : biases.to(orig_dtype),   # (N*P,)
+            'similarities': sim_per_tile,           # (N, P) float32
             'n_tiles'     : N,
         }
+
  
     # ------------------------------------------------------------------
     # Decode

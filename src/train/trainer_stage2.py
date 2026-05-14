@@ -375,9 +375,18 @@ def train_stage2(data_dir: str,
 
             with torch.amp.autocast(device.type):
                 # Forward: encode → reconstruct
-                recon, stats = orchestrator(images)
+                results = orchestrator.encode(images)
+                stats = results['stats']
+                recon = orchestrator.reconstruct(results, images.shape[0], (images.shape[2], images.shape[3]))
 
                 # ── NaN Sentinel ────────────────────────────────────────
+                nan_detected = False
+                for key in ['geo', 'struct', 'neural']:
+                    if key in stats and stats.get(f'pct_{key}', 0) > 0:
+                        # Check results dict if it exists in local scope or via orchestrator
+                        # Actually, let's check recon directly first, but also check latents
+                        pass
+
                 if torch.isnan(recon).any():
                     print(f"  ❌ NaN in reconstruction — skipping batch.")
                     optimizer.zero_grad()
@@ -394,15 +403,23 @@ def train_stage2(data_dir: str,
                 # ── Rate Penalty (neural latents) ───────────────────────
                 # Encourage compact latent representations
                 l_rate = torch.tensor(0.0, device=device)
-                if hasattr(orchestrator, '_last_neural_latents'):
-                    latents = orchestrator._last_neural_latents
-                    if latents is not None:
-                        l_rate = torch.mean(torch.sqrt(latents ** 2 + EPS))
+                if 'neural' in results and results['neural'] is not None:
+                    latents = results['neural']
+                    if torch.isnan(latents).any():
+                        print("  ❌ NaN in neural latents! Skipping.")
+                        optimizer.zero_grad()
+                        continue
+                    l_rate = torch.mean(torch.sqrt(latents ** 2 + EPS))
 
                 # ── Total Loss ──────────────────────────────────────────
                 total_loss = (lambda_perceptual * l_perceptual
                             + lambda_edge       * torch.clamp(l_edge, max=2.0)
                             + lambda_rate       * l_rate)
+
+                if torch.isnan(total_loss):
+                    print(f"  ❌ NaN in total loss! (P:{l_perceptual.item():.4f}, E:{l_edge.item():.4f}, R:{l_rate.item():.4f})")
+                    optimizer.zero_grad()
+                    continue
 
             # ── Backward ────────────────────────────────────────────────
             if scaler:

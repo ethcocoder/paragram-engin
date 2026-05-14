@@ -113,8 +113,11 @@ class ComplexityMask(nn.Module):
                 'stats'      : dict with float ratios for logging
         """
         with torch.no_grad():
-            variance    = self._spatial_variance(tiles)       # (B,)
-            periodicity = self._fourier_periodicity(tiles)    # (B,)
+            # Force float32 for routing calculations (FFT and variance)
+            tiles_f32   = tiles.float()
+            variance    = self._spatial_variance(tiles_f32)       # (B,)
+            periodicity = self._fourier_periodicity(tiles_f32)    # (B,)
+
  
         B    = tiles.shape[0]
         mask = torch.full((B,), self.STATE_NEURAL,

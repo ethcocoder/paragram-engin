@@ -229,7 +229,8 @@ def train_stage1(data_dir, epochs=20, batch_size=8, lr=1e-4, resume=True, image_
             optimizer.zero_grad()
             
             with torch.amp.autocast(device.type):
-                results = orchestrator.encode(images)
+                results = orchestrator.encode(images, current_epoch=epoch)
+
                 
                 nan_detected = False
                 for key in ['geo', 'struct', 'neural']:

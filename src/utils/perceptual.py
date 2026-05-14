@@ -135,9 +135,10 @@ class MSSSIM(nn.Module):
                 ssim_final = ssim_val
 
         # Product of weighted contrast-structure terms × final SSIM
+        # Clamp mcs to 1e-8 to avoid NaNs when similarity is negative
         result = ssim_final
         for i, mcs in enumerate(mcs_list):
-            result = result * (mcs ** self.weights[i])
+            result = result * (torch.clamp(mcs, min=1e-8) ** self.weights[i])
 
         return result.mean()    # scalar
 

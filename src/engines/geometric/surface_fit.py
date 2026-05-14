@@ -92,20 +92,24 @@ class GeometricEngine(nn.Module):
         assert T == self.tile_size, f"Expected tile size {self.tile_size}, got {T}"
  
         # Reshape pixels: (N, C, T*T) → (N*C, T*T)
-        pixels = tiles.view(N * C, T * T)           # (N*C, T*T)
+        # FORCE float32 for solve operation: cuSolver doesn't support FP16 for solve
+        orig_dtype = tiles.dtype
+        
+        with torch.amp.autocast('cuda', enabled=False):
+            pixels = tiles.view(N * C, T * T).float()
+
+            # Least-squares fit:  A @ coeffs ≈ pixels
+            # Solve: A^T A coeffs = A^T pixels  → normal equation
+            A     = self._A.float()                     # (T*T, 10)
+            AtA   = A.t() @ A                           # (10, 10)
+            Atp   = A.t() @ pixels.t()                  # (10, N*C)
  
-        # Least-squares fit:  A @ coeffs ≈ pixels
-        # torch.linalg.lstsq returns solution of shape (T*T, N*C)
-        # We need coeffs of shape (N*C, 10)
-        # Solve: A^T A coeffs = A^T pixels  → normal equation
-        A     = self._A                             # (T*T, 10)
-        AtA   = A.t() @ A                           # (10, 10)
-        Atp   = A.t() @ pixels.t()                  # (10, N*C)
+            # Solve using FP32 precision
+            coeffs_T = torch.linalg.solve(AtA, Atp)    # (10, N*C)
+            coeffs   = coeffs_T.t().view(N, C, 10)     # (N, C, 10)
  
-        # Use lstsq for numerical stability
-        coeffs_T = torch.linalg.solve(AtA, Atp)    # (10, N*C)
-        coeffs   = coeffs_T.t().view(N, C, 10)     # (N, C, 10)
-        return coeffs
+        # Return in original dtype if it was Half (for compatibility with rest of pipeline)
+        return coeffs.to(orig_dtype)
  
     # ------------------------------------------------------------------
     # Decode

@@ -25,32 +25,31 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
- 
+
 from src.core.complexity_mask import ComplexityMask
- 
- 
+
 class HybridOrchestrator(nn.Module):
-    """
-    Routes tiles through the three engines and stitches results.
- 
-    Args:
-        geo_engine    : GeometricEngine instance
-        struct_engine : StructuralEngine instance
-        neural_engine : LightweightNeuralEngine instance
-        tile_size     (int)  : edge length of tiles (default 128)
-        overlap       (float): fractional overlap between tiles (default 0.5)
-        var_threshold (float): complexity mask variance threshold
-        fourier_ratio (float): complexity mask Fourier ratio threshold
-    """
- 
     def __init__(self,
                  geo_engine,
                  struct_engine,
                  neural_engine,
-                 tile_size: int   = 128,
-                 overlap: float   = 0.5,
-                 var_threshold: float = 0.002,
-                 fourier_ratio: float = 8.0):
+                 tile_size: int = 128,
+                 overlap: float = 0.5,
+                 var_threshold: float = 0.015,
+                 fourier_ratio: float = 150.0):
+
+        """
+        Routes tiles through the three engines and stitches results.
+        
+        Args:
+            geo_engine    : GeometricEngine instance
+            struct_engine : StructuralEngine instance
+            neural_engine : LightweightNeuralEngine instance
+            tile_size     : edge length of tiles
+            overlap       : fractional overlap between tiles
+            var_threshold : complexity mask variance threshold
+            fourier_ratio : complexity mask Fourier ratio threshold
+        """
         super().__init__()
         self.geo_engine    = geo_engine
         self.struct_engine = struct_engine
@@ -58,212 +57,163 @@ class HybridOrchestrator(nn.Module):
         self.tile_size     = tile_size
         self.overlap       = overlap
         self.mask_module   = ComplexityMask(var_threshold, fourier_ratio)
-        self._gauss_cache  = {}   # device → gaussian window tensor
- 
-    # ------------------------------------------------------------------
-    # Gaussian window (cached per device)
-    # ------------------------------------------------------------------
- 
-    def _gaussian_window(self, device: torch.device) -> torch.Tensor:
-        """Return a (1, 1, tile_size, tile_size) Gaussian weight window."""
-        key = str(device)
+        self._gauss_cache  = {}
+
+    def get_curriculum_threshold(self, epoch: int):
+        """Start loose (0.70) and tighten to 0.95 over 20 epochs."""
+        return min(0.95, 0.70 + (epoch * 0.0125))
+
+    def _gaussian_window(self, device: torch.device, dtype=torch.float32) -> torch.Tensor:
+        key = f"{device}_{dtype}"
         if key not in self._gauss_cache:
             T = self.tile_size
             sigma = T / 6.0
-            ax    = torch.arange(T, dtype=torch.float32) - T / 2.0
+            ax = torch.arange(T, device=device, dtype=dtype) - T / 2.0
             gauss = torch.exp(-ax**2 / (2 * sigma**2))
-            window = gauss.unsqueeze(0) * gauss.unsqueeze(1)   # (T, T)
-            window = window / window.max()                      # normalise to [0,1]
-            self._gauss_cache[key] = window.unsqueeze(0).unsqueeze(0).to(device)
+            window = gauss.unsqueeze(0) * gauss.unsqueeze(1)
+            window = window / window.max()
+            self._gauss_cache[key] = window.unsqueeze(0).unsqueeze(0)
         return self._gauss_cache[key]
- 
-    # ------------------------------------------------------------------
-    # Tiling helpers
-    # ------------------------------------------------------------------
- 
+
     def extract_tiles(self, images: torch.Tensor):
-        """
-        Extract overlapping tiles from a batch of images.
- 
-        Args:
-            images: (B, C, H, W) float tensor.
- 
-        Returns:
-            tiles      : (N_total, C, T, T) — all tiles flattened
-            tile_info  : list of (b, top, left) for each tile
-            image_size : (H, W) of padded image
-        """
+        """Extract overlapping tiles using vectorized unfold."""
         B, C, H, W = images.shape
-        T    = self.tile_size
+        T = self.tile_size
         step = max(1, int(T * (1.0 - self.overlap)))
- 
-        # Pad so tiles cover the full image
-        pad_h = (T - H % T) % T if H % T != 0 else 0
-        pad_w = (T - W % T) % T if W % T != 0 else 0
-        if pad_h > 0 or pad_w > 0:
-            images = F.pad(images, (0, pad_w, 0, pad_h), mode='reflect')
- 
+
+        # Robust Padding for F.fold compatibility
+        pad_h = (step - (H - T) % step) % step if H > T else T - H
+        pad_w = (step - (W - T) % step) % step if W > T else T - W
+        images = F.pad(images, (0, pad_w, 0, pad_h), mode='reflect')
+
         _, _, H2, W2 = images.shape
-        tops  = list(range(0, H2 - T + 1, step))
-        lefts = list(range(0, W2 - T + 1, step))
-        # Ensure last tile reaches the edge
-        if tops[-1]  + T < H2: tops.append(H2 - T)
-        if lefts[-1] + T < W2: lefts.append(W2 - T)
- 
-        tiles     = []
-        tile_info = []
-        for b in range(B):
-            for top in tops:
-                for left in lefts:
-                    tiles.append(images[b, :, top:top+T, left:left+T])
-                    tile_info.append((b, top, left))
- 
-        tiles = torch.stack(tiles, dim=0)   # (N_total, C, T, T)
-        return tiles, tile_info, (H2, W2)
- 
-    # ------------------------------------------------------------------
-    # Encoding pass
-    # ------------------------------------------------------------------
- 
-    def encode(self, images: torch.Tensor) -> dict:
+        tiles = images.unfold(2, T, step).unfold(3, T, step)
+        NH, NW = tiles.shape[2], tiles.shape[3]
+        
+        # (B, C, NH, NW, T, T) -> (B*NH*NW, C, T, T)
+        tiles = tiles.permute(0, 2, 3, 1, 4, 5).reshape(-1, C, T, T)
+        return tiles, (NH, NW), (H2, W2)
+
+    def encode(self, images: torch.Tensor, current_epoch: int = 1) -> dict:
         """
-        Full encoding pass: tile → route → encode per engine.
- 
-        Args:
-            images: (B, C, H, W) float tensor in [0, 1].
- 
-        Returns:
-            results dict suitable for passing to reconstruct().
+        Vectorized Encoding Pass:
+        1. Classify tiles via ComplexityMask.
+        2. Route and encode using G, S, and N engines.
+        3. Apply curriculum-based fallback for low-quality structural matches.
         """
-        tiles, tile_info, padded_size = self.extract_tiles(images)
+        tiles, grid_dim, padded_size = self.extract_tiles(images)
         routing = self.mask_module(tiles)
- 
-        geo_idx    = routing['geo_idx']
-        struct_idx = routing['struct_idx']
-        neural_idx = routing['neural_idx']
- 
+        mask = routing['mask']
+        sim_tau = self.get_curriculum_threshold(current_epoch)
+
         results = {
-            'tile_info'   : tile_info,
-            'padded_size' : padded_size,
-            'n_tiles'     : len(tile_info),
-            'routing_mask': routing['mask'],
-            'stats'       : routing['stats'],
-            'geo_idx'     : geo_idx,
-            'struct_idx'  : struct_idx,
-            'neural_idx'  : neural_idx,
+            'grid_dim': grid_dim,
+            'padded_size': padded_size,
+            'routing_mask': mask,
+            'stats': routing['stats'],
+            'geo': None, 'struct': None, 'neural': None
         }
- 
+
+        # --- 1. GEOMETRIC ---
+        geo_idx = (mask == 0).nonzero(as_tuple=True)[0]
         if geo_idx.numel() > 0:
             results['geo'] = self.geo_engine.encode(tiles[geo_idx])
- 
+
+        # --- 2. STRUCTURAL ---
+        struct_idx = (mask == 1).nonzero(as_tuple=True)[0]
         if struct_idx.numel() > 0:
-            results['struct'] = self.struct_engine.encode(tiles[struct_idx])
- 
+            s_data = self.struct_engine.encode(tiles[struct_idx])
+            
+            # Extract from dictionary safely
+            indices = s_data['indices']
+            rots    = s_data['rotations']
+            gains   = s_data['gains']
+            biases  = s_data['biases']
+            sims    = s_data['similarities']
+            
+            # Curriculum Fallback: Check if pattern match is sharp enough
+            sims_per_tile = sims.mean(dim=1) if sims.dim() > 1 else sims
+            bad_matches = (sims_per_tile < sim_tau)
+            
+            if bad_matches.any():
+                # Reroute rejected tiles to Neural Engine
+                mask[struct_idx[bad_matches]] = 2
+                good_mask = ~bad_matches
+                
+                # Filter payload for Structural
+                P = self.struct_engine.patches_per_tile
+                patch_mask = good_mask.repeat_interleave(P)
+                results['struct'] = {
+                    'indices':   indices[patch_mask],
+                    'rotations': rots[patch_mask],
+                    'gains':     gains[patch_mask],
+                    'biases':    biases[patch_mask],
+                    'n_tiles':   good_mask.sum().item()
+                }
+            else:
+                results['struct'] = {
+                    'indices':   indices,
+                    'rotations': rots,
+                    'gains':     gains,
+                    'biases':    biases,
+                    'n_tiles':   struct_idx.numel()
+                }
+
+        # --- 3. NEURAL ---
+        neural_idx = (mask == 2).nonzero(as_tuple=True)[0]
         if neural_idx.numel() > 0:
             results['neural'] = self.neural_engine.encode(tiles[neural_idx])
- 
+
         return results
- 
-    # ------------------------------------------------------------------
-    # Reconstruction / decode
-    # ------------------------------------------------------------------
- 
-    def reconstruct(self,
-                    results: dict,
-                    n_images: int,
-                    image_size: tuple,
-                    overlap: float = None) -> torch.Tensor:
-        """
-        Decode engine outputs and stitch tiles back into full images.
- 
-        Args:
-            results    : output dict from encode()
-            n_images   : number of images in the original batch (B)
-            image_size : (H, W) of the ORIGINAL (unpadded) images
-            overlap    : override overlap fraction (uses self.overlap if None)
- 
-        Returns:
-            (B, C, H, W) reconstructed images, clipped to [0, 1].
-        """
-        if overlap is None:
-            overlap = self.overlap
- 
-        tile_info    = results['tile_info']
-        padded_size  = results['padded_size']
-        routing_mask = results['routing_mask']
-        T            = self.tile_size
-        device       = routing_mask.device
-        H2, W2       = padded_size
-        orig_H, orig_W = image_size
- 
-        # Determine number of channels from any available decoded tile
-        # Fall back to 3 (RGB) if nothing is available yet.
-        C = 3
-        if 'geo' in results and results['geo'] is not None:
-            sample = self.geo_engine.decode(results['geo'][:1])
-            C = sample.shape[1]
- 
-        # Accumulators for Gaussian-weighted blending
-        canvas  = torch.zeros(n_images, C, H2, W2, device=device)
-        weights = torch.zeros(n_images, 1,  H2, W2, device=device)
-        gauss   = self._gaussian_window(device)               # (1,1,T,T)
- 
-        # Decode all tiles per engine in one batch call
-        target_dtype = canvas.dtype
- 
-        all_rendered = torch.zeros(len(tile_info), C, T, T,
-                                   device=device, dtype=target_dtype)
- 
-        geo_idx    = results.get('geo_idx',    torch.tensor([], dtype=torch.long))
-        struct_idx = results.get('struct_idx', torch.tensor([], dtype=torch.long))
-        neural_idx = results.get('neural_idx', torch.tensor([], dtype=torch.long))
- 
-        if geo_idx.numel() > 0 and 'geo' in results:
-            decoded = self.geo_engine.decode(results['geo']).to(target_dtype)
-            all_rendered[geo_idx] = decoded
- 
-        if struct_idx.numel() > 0 and 'struct' in results:
-            decoded = self.struct_engine.decode(results['struct']).to(target_dtype)
- 
-            # Patch-vs-tile safety: struct may use similarity check; accept as-is
-            # If shape mismatch (should not happen post-fix), fall back to neural
-            if decoded.shape[0] == struct_idx.numel():
-                all_rendered[struct_idx] = decoded
-            else:
-                # Reroute mismatched tiles to neural if neural is available
-                if neural_idx.numel() > 0 and 'neural' in results:
-                    pass  # already handled below
- 
-        if neural_idx.numel() > 0 and 'neural' in results:
-            decoded = self.neural_engine.decode(results['neural']).to(target_dtype)
-            all_rendered[neural_idx] = decoded
- 
-        # Gaussian-weighted accumulation into canvas
-        for i, (b, top, left) in enumerate(tile_info):
-            tile_rendered = all_rendered[i]          # (C, T, T)
-            canvas [b, :, top:top+T, left:left+T] += tile_rendered * gauss[0]
-            weights[b, :, top:top+T, left:left+T] += gauss
- 
-        # Normalise by accumulated weights (safe divide)
-        canvas = canvas / weights.clamp(min=1e-6)
- 
-        # Crop back to original size and clamp
-        canvas = canvas[:, :, :orig_H, :orig_W]
-        return canvas.clamp(0.0, 1.0)
- 
-    # ------------------------------------------------------------------
-    # Convenience: encode + decode in one call (used during training)
-    # ------------------------------------------------------------------
- 
-    def forward(self, images: torch.Tensor) -> tuple:
-        """
-        Encode then immediately reconstruct.  Used in training loops.
- 
-        Returns:
-            (reconstructed, stats_dict)
-        """
-        B, C, H, W = images.shape
-        results = self.encode(images)
-        recon   = self.reconstruct(results, B, (H, W))
+
+    def reconstruct(self, results: dict, n_images: int, image_size: tuple, overlap: float = None) -> torch.Tensor:
+        """Vectorized Reconstruction using F.fold and Gaussian weighting."""
+        mask = results['routing_mask']
+        device = mask.device
+        NH, NW = results['grid_dim']
+        H2, W2 = results['padded_size']
+        T = self.tile_size
+        step = int(T * (1.0 - (overlap if overlap is not None else self.overlap)))
+
+        # Pre-render all tiles into a unified buffer
+        # Default to float32 for reconstruction stability
+        all_rendered = torch.zeros(mask.shape[0], 3, T, T, device=device, dtype=torch.float32)
+
+        if results['geo'] is not None:
+            g_idx = (mask == 0).nonzero(as_tuple=True)[0]
+            all_rendered[g_idx] = self.geo_engine.decode(results['geo']).to(all_rendered.dtype)
+
+        if results['struct'] is not None:
+            s_idx = (mask == 1).nonzero(as_tuple=True)[0]
+            # Use engine's decode method with the payload dictionary
+            all_rendered[s_idx] = self.struct_engine.decode(results['struct']).to(all_rendered.dtype)
+
+        if results['neural'] is not None:
+            n_idx = (mask == 2).nonzero(as_tuple=True)[0]
+            all_rendered[n_idx] = self.neural_engine.decode(results['neural']).to(all_rendered.dtype)
+
+
+        # Gaussian-weighted blending via F.fold
+        gauss = self._gaussian_window(device)
+        tiles_weighted = all_rendered * gauss[0]
+        
+        # (B*NH*NW, 3, T, T) -> (B, 3*T*T, NH*NW)
+        tiles_weighted = tiles_weighted.view(n_images, NH * NW, 3, T, T)
+        tiles_weighted = tiles_weighted.permute(0, 2, 3, 4, 1).reshape(n_images, 3*T*T, NH*NW)
+        
+        recon = F.fold(tiles_weighted, output_size=(H2, W2), kernel_size=T, stride=step)
+        
+        # Weighted normalization
+        weights_ones = torch.ones(n_images, 1, T, T, NH * NW, device=device) * gauss[0, 0].unsqueeze(-1)
+        weights_fold = F.fold(weights_ones.reshape(n_images, T*T, NH*NW), 
+                             output_size=(H2, W2), kernel_size=T, stride=step)
+        
+        final = recon / weights_fold.clamp(min=1e-4)
+        # Crop to original size
+        return final[:, :, :image_size[0], :image_size[1]].clamp(0, 1)
+
+    def forward(self, images: torch.Tensor, current_epoch: int = 1) -> tuple:
+        """Encode then immediately reconstruct."""
+        results = self.encode(images, current_epoch)
+        recon = self.reconstruct(results, images.shape[0], (images.shape[2], images.shape[3]))
         return recon, results['stats']
- 
