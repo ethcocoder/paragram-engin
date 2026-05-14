@@ -1,133 +1,150 @@
+"""
+complexity_mask.py — Aether-Blueprint v3.0
+==========================================
+Vectorized Fourier-Variance tile classifier.
+ 
+Responsibility:
+    Analyse every tile in a batch and assign one of three routing states:
+        State 0 (GEOMETRIC)  — low entropy, smooth gradients → Polynomial engine
+        State 1 (STRUCTURAL) — high periodicity, repeating textures → Codebook engine
+        State 2 (NEURAL)     — high chaotic energy, faces/detail → Neural engine
+ 
+    The decision uses two orthogonal signals computed in a single vectorised pass:
+        • Spatial variance  : overall energy level of the tile
+        • Fourier periodicity: ratio of spectral peak power to mean power
+                               (high ratio → periodic/textured)
+ 
+Design notes:
+    - All operations are batched on the input device (CPU or CUDA).
+    - Thresholds are configurable so the caller can tune routing ratios.
+    - Returns both the integer mask and boolean index tensors for direct
+      use by the orchestrator.
+"""
+ 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.fft
-import numpy as np
-
+ 
+ 
 class ComplexityMask(nn.Module):
-    def __init__(self, threshold_low=0.01, threshold_periodicity=50.0):
+    """
+    Classifies image tiles into three routing states using Fourier-Variance analysis.
+ 
+    Args:
+        var_threshold   (float): Tiles with spatial variance below this value are
+                                 routed to the Geometric engine (State 0).
+                                 Default 0.002 works well for [0,1]-normalised tiles.
+        fourier_ratio   (float): Tiles whose FFT peak/mean ratio exceeds this are
+                                 routed to the Structural engine (State 1).
+                                 Default 8.0 captures clear texture periodicity.
+    """
+ 
+    STATE_GEOMETRIC  = 0
+    STATE_STRUCTURAL = 1
+    STATE_NEURAL     = 2
+ 
+    def __init__(self, var_threshold: float = 0.002, fourier_ratio: float = 8.0):
         super().__init__()
-        # Learnable thresholds
-        self.threshold_low = nn.Parameter(torch.tensor([threshold_low]))
-        self.threshold_periodicity = nn.Parameter(torch.tensor([threshold_periodicity]))
-        
-        # Laplacian Kernel for variance/energy calculation
-        kernel = torch.tensor([
-            [0, 1, 0],
-            [1, -4, 1],
-            [0, 1, 0]
-        ], dtype=torch.float32).view(1, 1, 3, 3)
-        self.register_buffer('laplacian_kernel', kernel)
-
-    def forward(self, x):
-        """
-        Analyzes batch of tiles and returns a Tri-State Mask.
-        Args:
-            x (Tensor): Input image tiles [B, 3, 128, 128]
-        Returns:
-            Tensor: Tri-state mask [B, 1] with values {0, 1, 2}
-        """
-        B, C, H, W = x.shape
-        
-        # Convert to grayscale for analysis
-        x_gray = x.mean(dim=1, keepdim=True)
-        
-        # --- Level 1: Entropy Check (Vacuum vs Complex) ---
-        # Calculate Laplacian variance per tile
-        laplacian = F.conv2d(x_gray, self.laplacian_kernel, padding=1)
-        variance = torch.var(laplacian, dim=(2, 3)) # [B, 1]
-        
-        # Initial mask: 0 for low variance, 2 for high (will refine to 1 later)
-        mask = torch.where(variance < self.threshold_low, 
-                          torch.zeros_like(variance), 
-                          torch.full_like(variance, 2.0))
-        
-        # --- Level 2: Periodicity Check (Texture vs Detail) ---
-        # Only analyze tiles that are NOT State 0
-        complex_indices = (mask > 0).view(-1)
-        
-        if complex_indices.any():
-            x_complex = x_gray[complex_indices]
-            
-            # 2D Real FFT
-            # Shifted FFT to put DC in center? Actually rfft2 is enough for power spectrum
-            fft = torch.fft.rfft2(x_complex, norm='ortho')
-            power_spectrum = torch.abs(fft)
-            
-            # Calculate Periodicity Score
-            # We look for dominant peaks relative to the mean power (excluding DC)
-            # Flatten spatial dims of spectrum
-            power_flat = power_spectrum.view(x_complex.shape[0], -1)
-            
-            # Remove DC component (first element)
-            power_no_dc = power_flat[:, 1:]
-            
-            max_power = torch.max(power_no_dc, dim=1)[0]
-            mean_power = torch.mean(power_no_dc, dim=1)
-            
-            # Periodicity Score: Ratio of Max Power to Mean Power
-            # High ratio indicates a strong repeating pattern (peakiness)
-            periodicity_score = max_power / (mean_power + 1e-8)
-            
-            # Refine mask: If periodicity > threshold, set to 1 (Texture)
-            is_texture = (periodicity_score > self.threshold_periodicity).to(mask.dtype)
-            
-            # Map back to original indices
-            # complex_indices is a boolean mask of shape [B]
-            complex_mask = mask[complex_indices]
-            # If is_texture is 1, we want result to be 1. If 0, keep as 2.
-            # Logic: result = 1 if is_texture else 2
-            refined_states = torch.where(is_texture.unsqueeze(1) > 0, 
-                                        torch.ones_like(complex_mask), 
-                                        torch.full_like(complex_mask, 2.0))
-            
-            mask[complex_indices] = refined_states
-
-        return mask.long()
-
+        self.var_threshold = var_threshold
+        self.fourier_ratio = fourier_ratio
+ 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+ 
     @staticmethod
-    def visualize_mask(image, mask, tile_size=128):
+    def _spatial_variance(tiles: torch.Tensor) -> torch.Tensor:
         """
-        Overlays tri-state colors on the original image for debugging.
-        Blue (0): Vacuum
-        Green (1): Texture
-        Red (2): Detail
-        
+        Compute per-tile spatial variance across H×W×C.
+ 
         Args:
-            image (Tensor): Full image [3, H, W]
-            mask (Tensor): Mask per tile [N_tiles, 1]
+            tiles: (B, C, H, W) float tensor in [0, 1].
+        Returns:
+            (B,) variance tensor.
         """
-        import matplotlib.pyplot as plt
-        
-        C, H, W = image.shape
-        num_tiles_h = H // tile_size
-        num_tiles_w = W // tile_size
-        
-        # Reshape mask to 2D grid
-        mask_grid = mask.view(num_tiles_h, num_tiles_w).cpu().numpy()
-        
-        # Create color overlay
-        overlay = np.zeros((H, W, 3))
-        
-        colors = [
-            [0, 0, 1], # 0: Blue (Vacuum)
-            [0, 1, 0], # 1: Green (Texture)
-            [1, 0, 0]  # 2: Red (Detail)
-        ]
-        
-        for i in range(num_tiles_h):
-            for j in range(num_tiles_w):
-                state = int(mask_grid[i, j])
-                color = colors[state]
-                y1, y2 = i * tile_size, (i + 1) * tile_size
-                x1, x2 = j * tile_size, (j + 1) * tile_size
-                overlay[y1:y2, x1:x2] = color
-                
-        # Alpha blending
-        img_np = image.permute(1, 2, 0).cpu().numpy()
-        # Normalize image to 0-1 if it isn't
-        if img_np.max() > 1.0: img_np /= 255.0
-        
-        blended = img_np * 0.6 + overlay * 0.4
-        
-        return blended
+        B = tiles.shape[0]
+        flat = tiles.view(B, -1)                    # (B, C*H*W)
+        return flat.var(dim=1)                      # (B,)
+ 
+    @staticmethod
+    def _fourier_periodicity(tiles: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-tile FFT peak-to-mean ratio as a periodicity score.
+ 
+        Args:
+            tiles: (B, C, H, W) float tensor.
+        Returns:
+            (B,) periodicity ratio tensor.
+        """
+        # Greyscale approximation — fast and sufficient for routing
+        grey = tiles.mean(dim=1)                    # (B, H, W)
+ 
+        fft  = torch.fft.rfft2(grey)               # (B, H, W//2+1) complex
+        mag  = fft.abs()                            # magnitude spectrum
+ 
+        B    = mag.shape[0]
+        flat = mag.view(B, -1)                      # (B, N)
+ 
+        # Zero out DC component (index 0) before measuring peaks
+        flat_no_dc          = flat.clone()
+        flat_no_dc[:, 0]    = 0.0
+ 
+        peak  = flat_no_dc.max(dim=1).values        # (B,)
+        mean  = flat_no_dc.mean(dim=1).clamp(min=1e-6)
+ 
+        return peak / mean                          # (B,) ratio
+ 
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+ 
+    def forward(self, tiles: torch.Tensor) -> dict:
+        """
+        Classify a batch of tiles and return routing information.
+ 
+        Args:
+            tiles: (B, C, H, W) float tensor, values in [0, 1].
+ 
+        Returns:
+            dict with keys:
+                'mask'       : (B,) int tensor — state per tile (0, 1, or 2)
+                'geo_idx'    : 1-D LongTensor — batch indices routed to Geometric
+                'struct_idx' : 1-D LongTensor — batch indices routed to Structural
+                'neural_idx' : 1-D LongTensor — batch indices routed to Neural
+                'stats'      : dict with float ratios for logging
+        """
+        with torch.no_grad():
+            variance    = self._spatial_variance(tiles)       # (B,)
+            periodicity = self._fourier_periodicity(tiles)    # (B,)
+ 
+        B    = tiles.shape[0]
+        mask = torch.full((B,), self.STATE_NEURAL,
+                          dtype=torch.long, device=tiles.device)
+ 
+        # State 0: low variance → Geometric (smooth gradient regions)
+        is_geo               = variance < self.var_threshold
+        mask[is_geo]         = self.STATE_GEOMETRIC
+ 
+        # State 1: high periodicity AND not already geometric → Structural
+        is_struct            = (~is_geo) & (periodicity > self.fourier_ratio)
+        mask[is_struct]      = self.STATE_STRUCTURAL
+ 
+        # State 2: everything else → Neural (default)
+ 
+        geo_idx    = (mask == self.STATE_GEOMETRIC).nonzero(as_tuple=True)[0]
+        struct_idx = (mask == self.STATE_STRUCTURAL).nonzero(as_tuple=True)[0]
+        neural_idx = (mask == self.STATE_NEURAL).nonzero(as_tuple=True)[0]
+ 
+        stats = {
+            'pct_geometric'  : geo_idx.numel()    / B * 100,
+            'pct_structural' : struct_idx.numel() / B * 100,
+            'pct_neural'     : neural_idx.numel() / B * 100,
+        }
+ 
+        return {
+            'mask'       : mask,
+            'geo_idx'    : geo_idx,
+            'struct_idx' : struct_idx,
+            'neural_idx' : neural_idx,
+            'stats'      : stats,
+        }
+ 

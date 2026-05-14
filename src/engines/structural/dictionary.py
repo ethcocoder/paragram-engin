@@ -1,118 +1,235 @@
+"""
+dictionary.py — Aether-Blueprint v3.0
+=======================================
+Structural Engine: Pattern Memory Codebook.
+ 
+Responsibility:
+    Encode repeating-texture tiles by matching 32×32 sub-patches against a
+    learned 512-entry codebook.  Each match is stored as:
+        (codebook_index, rotation_id ∈ {0,1,2,3}, gain, bias)
+    totalling 7 bytes per patch vs. 32×32×3 = 3,072 bytes — a 439× ratio.
+ 
+    At decode time, the codebook entry is rotated and affine-corrected to
+    reproduce the original patch.
+ 
+Architecture:
+    - Codebook: nn.Embedding(512, 32*32*3) — learned during Stage 1.
+    - Matching: L2 nearest-neighbour over the flattened patch × codebook.
+                4-way rotation is tried; best match wins.
+    - Affine correction: per-patch gain and bias computed analytically
+                         from matched vs. target patch statistics.
+ 
+Patch-vs-tile indexing fix (from Stage 1 bug):
+    A 128×128 tile contains (128/32)² = 16 patches.
+    Similarity scores are (N_tiles × 16,) — they must be reshaped to
+    (N_tiles, 16) and reduced with min() before deciding neural fallback.
+    This class now returns per-tile min similarity for the orchestrator.
+"""
+ 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-class TextureCodebook(nn.Module):
-    """
-    Holds a dictionary of visual patterns (visual words).
-    Shape: (num_entries, 3, 32, 32)
-    """
-    def __init__(self, num_entries=512, patch_size=32):
-        super().__init__()
-        self.num_entries = num_entries
-        self.patch_size = patch_size
-        
-        # Initialize codebook with Gaussian distribution
-        # In a real scenario, this would be initialized via K-means on a dataset
-        self.codebook = nn.Parameter(torch.randn(num_entries, 3, patch_size, patch_size) * 0.1)
-
+import math
+ 
+ 
 class StructuralEngine(nn.Module):
     """
-    The Pattern Memory: Matches State 1 (Texture) tiles against the codebook.
-    Supports 4-way rotation and affine correction (Gain/Bias).
+    Dictionary-based texture codebook engine.
+ 
+    Args:
+        codebook_size (int): number of codebook entries (default 512)
+        patch_size    (int): sub-patch edge length (default 32)
+        tile_size     (int): full tile edge length (default 128)
     """
-    def __init__(self, num_entries=512, patch_size=32, fallback_threshold=0.80):
+ 
+    ROTATIONS = [0, 1, 2, 3]   # 0°, 90°, 180°, 270°
+ 
+    def __init__(self,
+                 codebook_size: int = 512,
+                 patch_size:    int = 32,
+                 tile_size:     int = 128):
         super().__init__()
-        self.patch_size = patch_size
-        self.fallback_threshold = fallback_threshold
-        self.codebook_module = TextureCodebook(num_entries, patch_size)
-        
-    def _subdivide(self, tiles):
-        """(B, 3, 128, 128) -> (B * 16, 3, 32, 32)"""
-        B, C, H, W = tiles.shape
-        # Unfold extracts sliding patches. With stride=patch_size, we get non-overlapping patches.
-        patches = tiles.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
-        # patches shape: (B, 3, 4, 4, 32, 32)
-        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(-1, C, self.patch_size, self.patch_size)
-        return patches
-
-    def encode(self, tiles):
+        self.codebook_size = codebook_size
+        self.patch_size    = patch_size
+        self.tile_size     = tile_size
+        self.patches_per_tile = (tile_size // patch_size) ** 2
+ 
+        # Codebook: each entry is a flat patch (P*P*C)
+        self.codebook = nn.Embedding(codebook_size, patch_size * patch_size * 3)
+        nn.init.normal_(self.codebook.weight, mean=0.5, std=0.1)
+ 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+ 
+    def _extract_patches(self, tiles: torch.Tensor) -> torch.Tensor:
         """
-        Full structural encoding pipeline.
-        Returns indices, params, and the maximum similarity scores.
-        """
-        patches = self._subdivide(tiles)
-        return self._match_vectorized(patches)
-
-    def _match_vectorized(self, patches):
-        """
-        Matches patches against codebook with 4 rotations.
+        Extract non-overlapping patches from tiles.
+ 
+        Args:
+            tiles: (N, C, T, T)
         Returns:
-        indices (B*16), rotations (B*16), gains (B*16), biases (B*16), max_sims (B*16)
+            patches: (N * P, C, Ps, Ps)  where P = patches_per_tile
         """
-        # ... (implementation same as before but returning max_sim)
-        cb = self.codebook_module.codebook
-        cb_rots = torch.stack([
-            cb,
-            torch.rot90(cb, 1, [2, 3]),
-            torch.rot90(cb, 2, [2, 3]),
-            torch.rot90(cb, 3, [2, 3])
-        ], dim=0)
-        
-        N_rots, N_entries, C, H, W = cb_rots.shape
-        num_patches = patches.shape[0]
-        
-        patches_flat = patches.reshape(num_patches, -1)
-        cb_rots_flat = cb_rots.reshape(N_rots * N_entries, -1)
-        
-        patches_norm = F.normalize(patches_flat, p=2, dim=1)
-        cb_rots_norm = F.normalize(cb_rots_flat, p=2, dim=1)
-        
-        sim = torch.matmul(patches_norm, cb_rots_norm.t())
-        max_sim, best_idx_flat = torch.max(sim, dim=1)
-        
-        rot_indices = best_idx_flat // N_entries
-        entry_indices = best_idx_flat % N_entries
-        
-        best_cb_patches = cb_rots[rot_indices, entry_indices]
-        
-        p_mean = patches.mean(dim=(1,2,3), keepdim=True)
-        e_mean = best_cb_patches.mean(dim=(1,2,3), keepdim=True)
-        
-        p_centered = patches - p_mean
-        e_centered = best_cb_patches - e_mean
-        
-        gain = (p_centered * e_centered).sum(dim=(1,2,3)) / ((e_centered**2).sum(dim=(1,2,3)) + 1e-8)
-        gain = torch.clamp(gain, 0.1, 10.0)
-        bias = p_mean.squeeze() - gain * e_mean.squeeze()
-        
-        return entry_indices, rot_indices, gain, bias, max_sim
-
-    def render(self, indices, rotations, gains, biases, B):
+        N, C, T, _ = tiles.shape
+        Ps = self.patch_size
+        P  = T // Ps
+        # unfold → (N, C, P, P, Ps, Ps) → (N*P², C, Ps, Ps)
+        patches = tiles.unfold(2, Ps, Ps).unfold(3, Ps, Ps)
+        patches = patches.contiguous().view(N, C, P, P, Ps, Ps)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+        patches = patches.view(N * P * P, C, Ps, Ps)
+        return patches
+ 
+    @staticmethod
+    def _rotate_k(x: torch.Tensor, k: int) -> torch.Tensor:
+        """Rotate tensor (C, Ps, Ps) by k*90 degrees."""
+        if k == 0:
+            return x
+        return torch.rot90(x, k, dims=[-2, -1])
+ 
+    def _affine_correct(self,
+                        src: torch.Tensor,
+                        tgt: torch.Tensor) -> tuple:
         """
-        Reconstructs tiles from codebook indices and parameters.
+        Compute per-patch gain and bias so that  gain * src + bias ≈ tgt.
+        Returns (gain, bias) as scalars per patch.
         """
-        cb = self.codebook_module.codebook
-        N_entries, C, H, W = cb.shape
-        
-        # Retrieve base patches
-        patches = cb[indices] # (P, 3, 32, 32)
-        
-        # Apply 4-way rotations (vectorized is tricky, using a loop over 4 rotations is faster/cleaner here)
-        final_patches = torch.zeros_like(patches)
-        for r in range(4):
-            mask = (rotations == r)
+        # Flatten spatial dims
+        s = src.reshape(src.shape[0], -1).float()   # (N, D)
+        t = tgt.reshape(tgt.shape[0], -1).float()
+ 
+        s_mean = s.mean(dim=1, keepdim=True)
+        t_mean = t.mean(dim=1, keepdim=True)
+        s_std  = s.std(dim=1, keepdim=True).clamp(min=1e-6)
+        t_std  = t.std(dim=1, keepdim=True).clamp(min=1e-6)
+ 
+        gain = (t_std / s_std).squeeze(1)           # (N,)
+        bias = (t_mean - gain.unsqueeze(1) * s_mean).squeeze(1)  # (N,)
+        return gain, bias
+ 
+    # ------------------------------------------------------------------
+    # Encode
+    # ------------------------------------------------------------------
+ 
+    def encode(self, tiles: torch.Tensor) -> dict:
+        """
+        Encode a batch of tiles to codebook indices + affine params.
+ 
+        Args:
+            tiles: (N, C, T, T) float tensor.
+ 
+        Returns:
+            dict with:
+                'indices'       : (N*P,) LongTensor — codebook index per patch
+                'rotations'     : (N*P,) LongTensor — rotation id
+                'gains'         : (N*P,) FloatTensor
+                'biases'        : (N*P,) FloatTensor
+                'similarities'  : (N, P) FloatTensor — min sim per tile (for OOL check)
+                'n_tiles'       : int
+        """
+        N  = tiles.shape[0]
+        Ps = self.patch_size
+        P  = self.patches_per_tile
+ 
+        patches   = self._extract_patches(tiles)    # (N*P, C, Ps, Ps)
+        NP        = patches.shape[0]
+        flat_p    = patches.view(NP, -1).float()    # (N*P, D)  D=C*Ps*Ps
+ 
+        # Codebook entries
+        cb        = self.codebook.weight              # (K, D)
+        cb_norm   = F.normalize(cb, dim=1)
+        flat_norm = F.normalize(flat_p, dim=1)
+ 
+        # Try all 4 rotations, keep best
+        D = Ps * Ps * 3
+        best_sim  = torch.full((NP,), -1.0, device=tiles.device)
+        best_idx  = torch.zeros(NP, dtype=torch.long, device=tiles.device)
+        best_rot  = torch.zeros(NP, dtype=torch.long, device=tiles.device)
+ 
+        for rot_k in self.ROTATIONS:
+            rot_patches  = torch.stack([self._rotate_k(patches[i], rot_k)
+                                        for i in range(NP)])   # (NP, C, Ps, Ps)
+            rot_flat     = F.normalize(rot_patches.view(NP, -1).float(), dim=1)
+            sims         = rot_flat @ cb_norm.t()               # (NP, K)
+            top_sim, top_idx = sims.max(dim=1)                  # (NP,)
+            better = top_sim > best_sim
+            best_sim[better] = top_sim[better]
+            best_idx[better] = top_idx[better]
+            best_rot[better] = rot_k
+ 
+        # Affine correction using best-matching (rotated) codebook entry
+        matched_cb  = self.codebook(best_idx)                   # (NP, D)
+        matched_tiled = torch.zeros_like(matched_cb)
+        for rot_k in self.ROTATIONS:
+            mask = best_rot == rot_k
             if mask.any():
-                final_patches[mask] = torch.rot90(patches[mask], r, [2, 3])
-                
-        # Apply Gain and Bias
-        # gains: (P), biases: (P)
-        final_patches = final_patches * gains.view(-1, 1, 1, 1) + biases.view(-1, 1, 1, 1)
-        
-        # Reshape and stitch back into (B, 3, 128, 128)
-        # final_patches: (B*16, 3, 32, 32)
-        P = final_patches.shape[0]
-        tiles = final_patches.reshape(B, 4, 4, 3, 32, 32)
-        tiles = tiles.permute(0, 3, 1, 4, 2, 5).reshape(B, 3, 128, 128)
-        
-        return tiles
+                # rotate the codebook patch
+                cb_patches = matched_cb[mask].view(-1, 3, Ps, Ps)
+                rot_cb     = torch.stack([self._rotate_k(cb_patches[i], rot_k)
+                                          for i in range(cb_patches.shape[0])])
+                matched_tiled[mask] = rot_cb.view(-1, D)
+ 
+        gains, biases = self._affine_correct(matched_tiled, flat_p)
+ 
+        # Reshape similarities to (N, P) for tile-level min check
+        sim_per_tile = best_sim.view(N, P)          # (N, P)
+ 
+        return {
+            'indices'     : best_idx,               # (N*P,)
+            'rotations'   : best_rot,               # (N*P,)
+            'gains'       : gains,                  # (N*P,)
+            'biases'      : biases,                 # (N*P,)
+            'similarities': sim_per_tile,           # (N, P)
+            'n_tiles'     : N,
+        }
+ 
+    # ------------------------------------------------------------------
+    # Decode
+    # ------------------------------------------------------------------
+ 
+    def decode(self, encoded: dict) -> torch.Tensor:
+        """
+        Reconstruct tiles from codebook indices and affine params.
+ 
+        Args:
+            encoded: dict from encode()
+ 
+        Returns:
+            tiles: (N, C, T, T) float tensor.
+        """
+        indices   = encoded['indices']
+        rotations = encoded['rotations']
+        gains     = encoded['gains']
+        biases    = encoded['biases']
+        N         = encoded['n_tiles']
+        Ps        = self.patch_size
+        T         = self.tile_size
+        P_edge    = T // Ps                          # patches per row/col
+        P         = self.patches_per_tile
+        NP        = N * P
+        device    = indices.device
+ 
+        # Fetch and rotate codebook entries
+        cb_entries = self.codebook(indices)          # (NP, D)
+        reconstructed = torch.zeros_like(cb_entries)
+        for rot_k in self.ROTATIONS:
+            mask = rotations == rot_k
+            if mask.any():
+                cp = cb_entries[mask].view(-1, 3, Ps, Ps)
+                rp = torch.stack([self._rotate_k(cp[i], rot_k)
+                                  for i in range(cp.shape[0])])
+                reconstructed[mask] = rp.view(-1, cb_entries.shape[1])
+ 
+        # Apply affine correction
+        g = gains.view(NP, 1)
+        b = biases.view(NP, 1)
+        reconstructed = g * reconstructed + b       # (NP, D)
+ 
+        # Reassemble patches into tiles
+        patches = reconstructed.view(NP, 3, Ps, Ps)
+        patches = patches.view(N, P_edge, P_edge, 3, Ps, Ps)
+        patches = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
+        tiles   = patches.view(N, 3, T, T)
+        return tiles.clamp(0.0, 1.0)
+ 
