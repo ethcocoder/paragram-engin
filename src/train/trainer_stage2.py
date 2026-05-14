@@ -53,7 +53,7 @@ class Stage2Dataset(Dataset):
     Dataset for Stage 2 perceptual refinement.
     Uses lighter augmentation than Stage 1 to preserve detail.
     """
-    def __init__(self, data_dir, image_size=512):
+    def __init__(self, data_dir, image_size=512, max_images=2000):
         self.data_dir = Path(data_dir)
         self.image_paths = []
         for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
@@ -63,7 +63,15 @@ class Stage2Dataset(Dataset):
             p for p in self.image_paths
             if not p.name.startswith('.') and not p.name.startswith('__')
         ]
-        print(f"  📂 Found {len(self.image_paths)} images for Stage 2.")
+        
+        # FAST-TRACK: Subset for fine-tuning
+        import random
+        random.seed(42)
+        random.shuffle(self.image_paths)
+        if max_images and len(self.image_paths) > max_images:
+            self.image_paths = self.image_paths[:max_images]
+            
+        print(f"  📂 Fast-Track: Using {len(self.image_paths)} images for Stage 2 refinement.")
 
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(image_size, scale=(0.85, 1.0)),
@@ -79,7 +87,58 @@ class Stage2Dataset(Dataset):
             img = Image.open(self.image_paths[idx]).convert('RGB')
             return self.transform(img)
         except Exception:
-            return torch.zeros(3, 512, 512)
+            return torch.zeros(3, 256, 256)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Smoothness Losses: TV + Enhanced Edge Match
+# ──────────────────────────────────────────────────────────────────────────────
+
+def total_variation_loss(img: torch.Tensor) -> torch.Tensor:
+    """Penalize all sharp discontinuities across the entire image."""
+    tv_h = torch.sqrt(torch.pow(img[:, :, 1:, :] - img[:, :, :-1, :], 2) + 1e-6).mean()
+    tv_w = torch.sqrt(torch.pow(img[:, :, :, 1:] - img[:, :, :, :-1], 2) + 1e-6).mean()
+    return tv_h + tv_w
+
+def sobel_edge_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compare image gradients to ensure edges match perfectly."""
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=recon.device).float().view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=recon.device).float().view(1, 1, 3, 3)
+    
+    def get_grad(img):
+        img_grey = img.mean(dim=1, keepdim=True)
+        gx = F.conv2d(img_grey, sobel_x, padding=1)
+        gy = F.conv2d(img_grey, sobel_y, padding=1)
+        return torch.sqrt(gx**2 + gy**2 + 1e-6)
+        
+    return F.l1_loss(get_grad(recon), get_grad(target))
+
+
+def affine_smoothness_loss(struct_results: dict) -> torch.Tensor:
+    """
+    Penalize sharp jumps in gain/bias between adjacent 32x32 patches.
+    struct_results['gain'], ['bias'] are (N, 16, 3).
+    """
+    if 'gain' not in struct_results:
+        return torch.tensor(0.0)
+        
+    g = struct_results['gain']  # (N, 16, 3)
+    b = struct_results['bias']  # (N, 16, 3)
+    N, NP, C = g.shape
+    H = W = int(math.sqrt(NP))  # 4 for 128/32
+    
+    g = g.view(N, H, W, C)
+    b = b.view(N, H, W, C)
+    
+    # TV-style loss on the gain/bias grid
+    # Horizontal jumps
+    g_h = torch.abs(g[:, :, 1:, :] - g[:, :, :-1, :]).mean()
+    b_h = torch.abs(b[:, :, 1:, :] - b[:, :, :-1, :]).mean()
+    # Vertical jumps
+    g_v = torch.abs(g[:, 1:, :, :] - g[:, :-1, :, :]).mean()
+    b_v = torch.abs(b[:, 1:, :, :] - b[:, :-1, :, :]).mean()
+    
+    return g_h + b_h + g_v + b_v
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -308,23 +367,21 @@ def train_stage2(data_dir: str,
     for p in orchestrator.geo_engine.parameters():
         p.requires_grad = False
 
-    # UNFREEZE: SwinWindowAttention (in neural engine) + TextureCodebook (in structural)
-    # These are already unfrozen by default, but let's be explicit:
+    # UNFREEZE: SwinWindowAttention (neural) + Routing + Affine params
+    # FREEZE: The actual Codebook atoms (Stage 1 already perfected these)
     for name, p in orchestrator.neural_engine.named_parameters():
-        p.requires_grad = True  # All neural params trainable
+        p.requires_grad = True  # Neural engine remains fully trainable
     for name, p in orchestrator.struct_engine.named_parameters():
-        p.requires_grad = True  # Codebook + matching params
+        if 'codebook' in name:
+            p.requires_grad = False # DO NOT drift the codebook atoms
+        else:
+            p.requires_grad = True  # Train the gain/bias and matching logic
 
     trainable_params = [p for p in orchestrator.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable_params)
     print(f"  🧠 Trainable parameters: {n_trainable:,}")
 
-    # ── 4. Optimizer ────────────────────────────────────────────────────────
-    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-3)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.1)
-    scaler = torch.amp.GradScaler(device.type) if device.type == 'cuda' else None
-
-    # ── 5. Loss Functions ───────────────────────────────────────────────────
+    # ── 4. Loss Functions ───────────────────────────────────────────────────
     perceptual_criterion = PerceptualLoss(
         lpips_weight=0.5,
         ssim_weight=0.4,
@@ -335,17 +392,35 @@ def train_stage2(data_dir: str,
     for p in perceptual_criterion.parameters():
         p.requires_grad = False
 
-    # Loss weights for Stage 2
-    lambda_perceptual = 1.0       # Primary: perceptual quality
-    lambda_edge       = 0.3       # Gaussian overlap stitching guard
-    lambda_rate       = 0.005     # Gentle rate penalty (don't crush quality)
+    # Loss weights for Stage 2 (Ultra-Optimized)
+    lambda_perceptual = 1.0       # Primary: visual quality
+    lambda_edge       = 0.6       # Tile boundary stitching
+    lambda_tv         = 0.10      # General smoothing
+    lambda_sobel      = 0.20      # Gradient/Edge consistency
+    lambda_affine     = 0.40      # NEW: Smooths gain/bias jumps (Crucial!)
+    lambda_rate       = 0.005     # Latent compactness
+    
+    accumulation_steps = 4        # Batch 4 * 4 = Effective Batch 16
 
-    # ── 6. Data Loading ─────────────────────────────────────────────────────
-    dataset = Stage2Dataset(data_dir, image_size=image_size)
+    # ── 6. Data Loading (Fast-Track Subset) ──────────────────────────────────
+    # Focus refinement on a high-quality subset (2000 images)
+    dataset = Stage2Dataset(data_dir, image_size=image_size, max_images=2000)
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
         num_workers=2, pin_memory=True, drop_last=True
     )
+
+    # ── 7. Optimizer & OneCycle Scheduler ────────────────────────────────────
+    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-3)
+    
+    # OneCycleLR is designed for "Super-Convergence"
+    total_steps = epochs * len(dataloader)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=lr*2, total_steps=total_steps,
+        pct_start=0.2, div_factor=10, final_div_factor=100
+    )
+    
+    scaler = torch.amp.GradScaler(device.type) if device.type == 'cuda' else None
 
     os.makedirs('samples_s2', exist_ok=True)
     os.makedirs('checkpoints', exist_ok=True)
@@ -371,11 +446,11 @@ def train_stage2(data_dir: str,
             if p2p_test_image is None:
                 p2p_test_image = images[0].detach().cpu()
 
-            optimizer.zero_grad()
-
+            # optimizer.zero_grad() removed from here for correct accumulation
             with torch.amp.autocast(device.type):
                 # Forward: encode → reconstruct
-                results = orchestrator.encode(images)
+                # FIX: Pass epoch to enable quality curriculum (0.70 -> 0.95 fallback)
+                results = orchestrator.encode(images, current_epoch=epoch)
                 stats = results['stats']
                 recon = orchestrator.reconstruct(results, images.shape[0], (images.shape[2], images.shape[3]))
 
@@ -400,6 +475,9 @@ def train_stage2(data_dir: str,
                     recon, images, tile_size=tile_size, overlap=overlap
                 )
 
+                # ── Total Variation (Grid/Seam Removal) ──────────────────
+                l_tv = total_variation_loss(recon)
+
                 # ── Rate Penalty (neural latents) ───────────────────────
                 # Encourage compact latent representations
                 l_rate = torch.tensor(0.0, device=device)
@@ -411,30 +489,50 @@ def train_stage2(data_dir: str,
                         continue
                     l_rate = torch.mean(torch.sqrt(latents ** 2 + EPS))
 
+                # ── Affine Consistency (Checkerboard Removal) ─────────────
+                l_affine = torch.tensor(0.0, device=device)
+                if 'struct' in results and results['struct'] is not None:
+                    l_affine = affine_smoothness_loss(results['struct']).to(device)
+
+                # ── Sobel Edge Match (Ultra Effect) ──────────────────────
+                l_sobel = sobel_edge_loss(recon, images)
+
                 # ── Total Loss ──────────────────────────────────────────
                 total_loss = (lambda_perceptual * l_perceptual
                             + lambda_edge       * torch.clamp(l_edge, max=2.0)
+                            + lambda_tv         * torch.clamp(l_tv, max=3.0)
+                            + lambda_affine     * l_affine
+                            + lambda_sobel      * l_sobel
                             + lambda_rate       * l_rate)
 
+                # Normalize for accumulation
+                total_loss = total_loss / accumulation_steps
+
                 if torch.isnan(total_loss):
-                    print(f"  ❌ NaN in total loss! (P:{l_perceptual.item():.4f}, E:{l_edge.item():.4f}, R:{l_rate.item():.4f})")
+                    print(f"  ❌ NaN in total loss!")
+                    print(f"     Breakdown: P_total:{l_perceptual.item():.4f} | E:{l_edge.item():.4f} | TV:{l_tv.item():.4f} | R:{l_rate.item():.4f}")
                     optimizer.zero_grad()
                     continue
 
-            # ── Backward ────────────────────────────────────────────────
+            # ── Backward with Accumulation ──────────────────────────────
             if scaler:
                 scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
-                scaler.step(optimizer)
-                scaler.update()
+                if (step + 1) % accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
-                optimizer.step()
+                if (step + 1) % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-            # Stats
-            epoch_losses.append(total_loss.item())
+            # Stats (multiply back for logging)
+            current_loss_val = total_loss.item() * accumulation_steps
+            epoch_losses.append(current_loss_val)
             epoch_perceptual.append(l_perceptual.item())
             epoch_edge.append(l_edge.item())
 

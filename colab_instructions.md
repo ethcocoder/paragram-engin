@@ -39,7 +39,7 @@ To train the foundation on real images, run:
 
 **To resume training:**
 ```bash
-!python src/train/trainer_stage1.py dataset/flickr8k/images --size 256 --epochs 20 --batch_size 8
+!python src/train/trainer_stage2.py dataset/flickr8k/images --size 256 --epochs 20 --batch_size 16
 ```
 
 ## 3. Stage 2: Perceptual Refinement

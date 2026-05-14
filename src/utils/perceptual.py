@@ -114,33 +114,38 @@ class MSSSIM(nn.Module):
         Returns:
             scalar MS-SSIM value in [0, 1] (higher = more similar)
         """
-        # Convert to luminance (greyscale) for SSIM computation
-        weights_rgb = pred.new_tensor([0.2989, 0.5870, 0.1140])
-        p_lum = (pred   * weights_rgb.view(1, 3, 1, 1)).sum(1, keepdim=True)
-        t_lum = (target * weights_rgb.view(1, 3, 1, 1)).sum(1, keepdim=True)
+        # FORCE float32 for MS-SSIM calculations to avoid precision NaNs in mixed precision
+        with torch.amp.autocast('cuda', enabled=False):
+            # Convert to luminance (greyscale) for SSIM computation
+            p_f32 = pred.float()
+            t_f32 = target.float()
+            
+            weights_rgb = p_f32.new_tensor([0.2989, 0.5870, 0.1140])
+            p_lum = (p_f32   * weights_rgb.view(1, 3, 1, 1)).sum(1, keepdim=True)
+            t_lum = (t_f32 * weights_rgb.view(1, 3, 1, 1)).sum(1, keepdim=True)
 
-        mcs_list   = []
-        ssim_final = None
-        p, t       = p_lum, t_lum
+            mcs_list   = []
+            ssim_final = None
+            p, t       = p_lum, t_lum
 
-        for scale in range(self.n_scales):
-            ssim_val = _ssim_single_scale(p, t, self.kernel)
+            for scale in range(self.n_scales):
+                ssim_val = _ssim_single_scale(p, t, self.kernel)
 
-            if scale < self.n_scales - 1:
-                # Contrast-structure only for intermediate scales
-                mcs_list.append(ssim_val)
-                p = F.avg_pool2d(p, kernel_size=2, stride=2)
-                t = F.avg_pool2d(t, kernel_size=2, stride=2)
-            else:
-                ssim_final = ssim_val
+                if scale < self.n_scales - 1:
+                    # Contrast-structure only for intermediate scales
+                    mcs_list.append(ssim_val)
+                    p = F.avg_pool2d(p, kernel_size=2, stride=2)
+                    t = F.avg_pool2d(t, kernel_size=2, stride=2)
+                else:
+                    ssim_final = ssim_val
 
-        # Product of weighted contrast-structure terms × final SSIM
-        # Clamp mcs to 1e-8 to avoid NaNs when similarity is negative
-        result = ssim_final
-        for i, mcs in enumerate(mcs_list):
-            result = result * (torch.clamp(mcs, min=1e-8) ** self.weights[i])
+            # Product of weighted contrast-structure terms × final SSIM
+            # Clamp both ssim_final and mcs to 1e-8 to avoid NaNs
+            result = torch.clamp(ssim_final, min=1e-8)
+            for i, mcs in enumerate(mcs_list):
+                result = result * (torch.clamp(mcs, min=1e-8) ** self.weights[i])
 
-        return result.mean()    # scalar
+            return result.mean()    # scalar
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -158,7 +163,10 @@ class LPIPSLoss(nn.Module):
         self._use_lpips = False
         try:
             import lpips as lpips_lib
-            self._lpips = lpips_lib.LPIPS(net=net)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
+                self._lpips = lpips_lib.LPIPS(net=net)
             self._use_lpips = True
         except ImportError:
             # Fallback: VGG feature extraction using torchvision
@@ -178,27 +186,32 @@ class LPIPSLoss(nn.Module):
         Returns:
             scalar LPIPS distance (lower = more similar)
         """
-        if self._use_lpips:
-            # lpips expects inputs in [-1, 1]
-            p = pred   * 2 - 1
-            t = target * 2 - 1
-            return self._lpips(p, t).mean()
+        # FORCE float32 for LPIPS to avoid overflow in VGG backbone
+        with torch.amp.autocast('cuda', enabled=False):
+            p_f32 = pred.float()
+            t_f32 = target.float()
 
-        if self._vgg_features is not None:
-            # VGG feature L2 fallback
-            mean = pred.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-            std  = pred.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-            p = (pred   - mean) / std
-            t = (target - mean) / std
-            loss = pred.new_tensor(0.0)
-            for layer in self._vgg_features:
-                p = layer(p)
-                t = layer(t)
-            loss = F.mse_loss(p, t)
-            return loss
+            if self._use_lpips:
+                # lpips expects inputs in [-1, 1]
+                p = p_f32 * 2 - 1
+                t = t_f32 * 2 - 1
+                return self._lpips(p, t).mean()
 
-        # Last resort: simple L1 in image space
-        return F.l1_loss(pred, target)
+            if self._vgg_features is not None:
+                # VGG feature L2 fallback
+                mean = p_f32.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+                std  = p_f32.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+                p = (p_f32   - mean) / std
+                t = (t_f32 - mean) / std
+                loss = p_f32.new_tensor(0.0)
+                for layer in self._vgg_features:
+                    p = layer(p)
+                    t = layer(t)
+                loss = F.mse_loss(p, t)
+                return loss
+
+            # Last resort: simple L1 in image space
+            return F.l1_loss(p_f32, t_f32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
