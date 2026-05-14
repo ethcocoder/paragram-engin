@@ -178,6 +178,10 @@ class StructuralEngine(nn.Module):
  
         gains, biases = self._affine_correct(matched_tiled, flat_p)
 
+        # Clamp affine parameters to prevent precision explosions and "sand" artifacts
+        gains = gains.clamp(0.1, 2.0)
+        biases = biases.clamp(-0.5, 0.5)
+
         # Reshape similarities to (N, P) for tile-level min check
         sim_per_tile = best_sim.view(N, P)          # (N, P)
 

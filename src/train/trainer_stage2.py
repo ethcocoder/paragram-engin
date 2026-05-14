@@ -117,26 +117,27 @@ def sobel_edge_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def affine_smoothness_loss(struct_results: dict) -> torch.Tensor:
     """
     Penalize sharp jumps in gain/bias between adjacent 32x32 patches.
-    struct_results['gain'], ['bias'] are (N, 16, 3).
     """
-    if 'gain' not in struct_results:
+    if 'gains' not in struct_results:
         return torch.tensor(0.0)
         
-    g = struct_results['gain']  # (N, 16, 3)
-    b = struct_results['bias']  # (N, 16, 3)
-    N, NP, C = g.shape
-    H = W = int(math.sqrt(NP))  # 4 for 128/32
+    g = struct_results['gains']  # (N*P,)
+    b = struct_results['biases'] # (N*P,)
     
-    g = g.view(N, H, W, C)
-    b = b.view(N, H, W, C)
+    NP = 16 # Assuming 128x128 tile with 32x32 patches
+    N = g.shape[0] // NP
+    H = W = 4
+    
+    g = g.view(N, H, W)
+    b = b.view(N, H, W)
     
     # TV-style loss on the gain/bias grid
     # Horizontal jumps
-    g_h = torch.abs(g[:, :, 1:, :] - g[:, :, :-1, :]).mean()
-    b_h = torch.abs(b[:, :, 1:, :] - b[:, :, :-1, :]).mean()
+    g_h = torch.abs(g[:, :, 1:] - g[:, :, :-1]).mean()
+    b_h = torch.abs(b[:, :, 1:] - b[:, :, :-1]).mean()
     # Vertical jumps
-    g_v = torch.abs(g[:, 1:, :, :] - g[:, :-1, :, :]).mean()
-    b_v = torch.abs(b[:, 1:, :, :] - b[:, :-1, :, :]).mean()
+    g_v = torch.abs(g[:, 1:, :] - g[:, :-1, :]).mean()
+    b_v = torch.abs(b[:, 1:, :] - b[:, :-1, :]).mean()
     
     return g_h + b_h + g_v + b_v
 
@@ -392,12 +393,12 @@ def train_stage2(data_dir: str,
     for p in perceptual_criterion.parameters():
         p.requires_grad = False
 
-    # Loss weights for Stage 2 (Ultra-Optimized)
+    # Loss weights for Stage 2 (Aggressive Smoothness post-clamp)
     lambda_perceptual = 1.0       # Primary: visual quality
-    lambda_edge       = 0.6       # Tile boundary stitching
-    lambda_tv         = 0.10      # General smoothing
-    lambda_sobel      = 0.20      # Gradient/Edge consistency
-    lambda_affine     = 0.40      # NEW: Smooths gain/bias jumps (Crucial!)
+    lambda_edge       = 0.5       # Tile boundary stitching (Restored)
+    lambda_tv         = 0.15      # General smoothing (Restored)
+    lambda_sobel      = 0.10      # Gradient consistency
+    lambda_affine     = 2.0       # HEAVY Affine smoothing to kill the 32x32 grid
     lambda_rate       = 0.005     # Latent compactness
     
     accumulation_steps = 4        # Batch 4 * 4 = Effective Batch 16
